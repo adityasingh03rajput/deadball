@@ -1,14 +1,11 @@
 import streamlit as st
-
+import streamlit.components.v1 as components
 import pygame
-
 import math
-
 import random
-
 import threading
-
 import time
+import pygbag  # Import pygbag
 
 # Constants
 WIDTH, HEIGHT = 800, 600
@@ -170,10 +167,9 @@ class Ball:
         dy = self.y - other.y
         distance = math.sqrt(dx**2 + dy**2)
         if distance < self.radius + other.radius:
-            if distance == 0:
-                distance = 0.001
+            if distance == 0:distance = 0.001
             angle = math.atan2(dy, dx)
-            overlap = self.radius+ other.radius - distance
+            overlap = self.radius + other.radius - distance
             self.x += math.cos(angle) * overlap / 2
             self.y += math.sin(angle) * overlap / 2
             other.x -= math.cos(angle) * overlap / 2
@@ -278,7 +274,7 @@ while running:
                     player.bullets.remove(bullet)
                     if other_player.health <= 0:
                         other_player.frozen = FREEZE_TIME
-            ball.collide(bullet)
+                ball.collide(bullet)
 
     ball.move()
 
@@ -302,8 +298,7 @@ while running:
         score_text = font.render(f"Score: {player.score}", True, WHITE)
         screen.blit(score_text, (player.x - 20, player.y - 45))
     for player in players:
-        for bullet in player.bullets:
-            pygame.draw.circle(screen, bullet.color, (int(bullet.x), int(bullet.y)), bullet.radius)
+        for bullet in player.bulletspygame.draw.circle(screen, bullet.color, (int(bullet.x), int(bullet.y)), bullet.radius)
 
     pygame.draw.circle(screen, ball.color, (int(ball.x), int(ball.y)), ball.radius)
     for goal in goalposts:
@@ -314,24 +309,20 @@ pygame.quit()
 
 
 def run_game():
-
     main()
 
-
-
 if __name__ == "__main__":
-
     st.title("Ball Game")
 
     if st.button("Start Game"):
+        # Compile with pygbag
+        import subprocess
+        subprocess.run(["pygbag", __file__, "-o", "pygbag_output"], check=True)
 
-        run_game()
-
-
-
-
-
-
-
-
-
+        # Embed the game
+        components.html(
+            open("pygbag_output/index.html", 'r', encoding='utf-8').read(),
+            width=800,
+            height=600,
+            scrolling=False,
+        )
