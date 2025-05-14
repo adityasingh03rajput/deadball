@@ -325,6 +325,22 @@
             display: none;
         }
 
+        .orientation-warning {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 20px;
+        }
+
         /* Stars background for entry screen */
         .stars {
             position: absolute;
@@ -374,9 +390,21 @@
                 display: none;
             }
         }
+
+        @media (orientation: portrait) and (max-width: 768px) {
+            .orientation-warning {
+                display: flex;
+            }
+        }
     </style>
 </head>
 <body>
+    <!-- Orientation Warning -->
+    <div class="orientation-warning">
+        <h2>Please rotate your device to landscape mode</h2>
+        <p>For the best gaming experience, please play in landscape orientation</p>
+    </div>
+
     <!-- Entry Screen -->
     <div id="entry-screen">
         <div class="stars" id="stars"></div>
@@ -474,6 +502,7 @@
         let connected = false;
         let lastStateSync = 0;
         let opponentName = 'Opponent';
+        let isLandscape = window.innerWidth > window.innerHeight;
 
         // DOM elements
         const entryScreen = document.getElementById('entry-screen');
@@ -489,6 +518,7 @@
         const aimToggle = document.getElementById('aim-toggle');
         const shootBtn = document.getElementById('shoot-btn');
         const joystickKnob = document.getElementById('joystick-knob');
+        const orientationWarning = document.querySelector('.orientation-warning');
 
         // Mobile controls variables
         let joystickActive = false;
@@ -545,6 +575,10 @@
                     document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
                     this.classList.add('active');
                     controlMode = this.dataset.mode;
+                    
+                    if (controlMode === 'mobile') {
+                        setupMobileControls();
+                    }
                 });
             });
 
@@ -570,13 +604,20 @@
                 entryScreen.style.display = 'flex';
             });
 
-            // Mobile controls
-            if (isMobile()) {
-                setupMobileControls();
-            }
-
-            // Handle window resize
+            // Handle window resize and orientation change
             window.addEventListener('resize', handleResize);
+            window.addEventListener('orientationchange', checkOrientation);
+            window.addEventListener('resize', checkOrientation);
+        }
+
+        // Check orientation and show/hide warning
+        function checkOrientation() {
+            isLandscape = window.innerWidth > window.innerHeight;
+            orientationWarning.style.display = (!isLandscape && isMobile()) ? 'flex' : 'none';
+            
+            if (canvas) {
+                handleResize();
+            }
         }
 
         // Check if mobile device
@@ -587,6 +628,14 @@
         // Set up mobile controls
         function setupMobileControls() {
             const joystickContainer = document.querySelector('.joystick-container');
+            
+            // Clear previous event listeners
+            joystickContainer.removeEventListener('touchstart', handleJoystickStart);
+            document.removeEventListener('touchstart', handleDocumentTouchStart);
+            document.removeEventListener('touchmove', handleJoystickMove);
+            document.removeEventListener('touchend', handleJoystickEnd);
+            shootBtn.removeEventListener('touchstart', handleShootStart);
+            shootBtn.removeEventListener('touchend', handleShootEnd);
             
             // Touch start
             joystickContainer.addEventListener('touchstart', handleJoystickStart);
@@ -599,28 +648,33 @@
             document.addEventListener('touchend', handleJoystickEnd);
             
             // Shoot button
-            shootBtn.addEventListener('touchstart', function(e) {
-                e.preventDefault();
-                isShooting = true;
-                this.style.transform = 'scale(0.9)';
-                this.style.background = 'rgba(255, 0, 0, 0.5)';
-            });
-            
-            shootBtn.addEventListener('touchend', function(e) {
-                e.preventDefault();
-                isShooting = false;
-                this.style.transform = 'scale(1)';
-                this.style.background = 'rgba(255, 0, 0, 0.3)';
-            });
+            shootBtn.addEventListener('touchstart', handleShootStart);
+            shootBtn.addEventListener('touchend', handleShootEnd);
             
             // Aim toggle
-            aimToggle.addEventListener('click', function() {
-                if (this.textContent === 'AIM: BALL') {
-                    this.textContent = 'AIM: PLAYER';
-                } else {
-                    this.textContent = 'AIM: BALL';
-                }
-            });
+            aimToggle.addEventListener('click', toggleAimMode);
+        }
+
+        function handleShootStart(e) {
+            e.preventDefault();
+            isShooting = true;
+            this.style.transform = 'scale(0.9)';
+            this.style.background = 'rgba(255, 0, 0, 0.5)';
+        }
+
+        function handleShootEnd(e) {
+            e.preventDefault();
+            isShooting = false;
+            this.style.transform = 'scale(1)';
+            this.style.background = 'rgba(255, 0, 0, 0.3)';
+        }
+
+        function toggleAimMode() {
+            if (this.textContent === 'AIM: BALL') {
+                this.textContent = 'AIM: PLAYER';
+            } else {
+                this.textContent = 'AIM: BALL';
+            }
         }
 
         function handleJoystickStart(e) {
@@ -682,8 +736,18 @@
             entryScreen.style.display = 'none';
             connectionScreen.style.display = 'flex';
             
-            // Create PeerJS connection
-            peer = new Peer();
+            // Create PeerJS connection with configuration for local network
+            const peerOptions = {
+                debug: 3,
+                config: {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' }
+                    ]
+                }
+            };
+            
+            peer = new Peer(peerOptions);
             
             peer.on('open', function(id) {
                 peerId = id;
@@ -696,7 +760,7 @@
                 
                 // Ask user if they want to host or join
                 connectionRole.innerHTML = `
-                    <p>Share your ID with a friend to connect</p>
+                    <p>Share your ID with a friend on the same WiFi</p>
                     <div class="btn-group" style="margin-top: 15px;">
                         <button class="btn" id="host-btn">Host Game</button>
                         <button class="btn" id="join-btn">Join Game</button>
@@ -736,7 +800,10 @@
         }
 
         function connectToPeer(peerId) {
-            conn = peer.connect(peerId);
+            conn = peer.connect(peerId, {
+                reliable: true,
+                serialization: 'json'
+            });
             setupConnection();
         }
 
@@ -1555,6 +1622,7 @@
         // Initialize the app
         createStars();
         setupEventListeners();
+        checkOrientation();
     </script>
 </body>
 </html>
