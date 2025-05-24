@@ -1,6 +1,8 @@
 flask
-requests
-python-dotenv
-gunicorn
-pygame
 gevent
+requests
+pywin32; sys_platform == 'win32'
+winsound; sys_platform == 'win32'
+pyaudio; sys_platform != 'win32'
+netifaces
+python-dotenv
