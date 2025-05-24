@@ -7,54 +7,88 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# Store attendance data
-attendance_data = {
-    'students': defaultdict(dict),
+# Store all data
+data = {
+    'attendance': defaultdict(dict),
     'last_ring': None,
-    'ring_students': []
-}
-
-# Store connected clients
-connected_clients = {
-    'students': {},
-    'teachers': {}
+    'ring_students': [],
+    'users': {},
+    'timetable': {}
 }
 
 # Configuration
 RING_INTERVAL = 300  # 5 minutes
 
-@app.route("/ping", methods=["POST"])
-def ping():
-    """Handle client heartbeats"""
-    data = request.json
-    client_type = data.get('type')
-    username = data.get('username')
+@app.route("/register", methods=["POST"])
+def register():
+    """Handle user registration (teacher only)"""
+    req_data = request.json
+    username = req_data.get('username')
+    password = req_data.get('password')
+    user_type = req_data.get('type')
     
-    if client_type and username:
-        connected_clients[client_type][username] = time.time()
-        return {"status": "ok"}, 200
-    return {"error": "Invalid data"}, 400
+    if user_type != 'teacher':
+        return {"error": "Only teachers can register"}, 400
+    
+    if username in data['users']:
+        return {"error": "Username already exists"}, 400
+        
+    data['users'][username] = {
+        'password': password,
+        'type': user_type
+    }
+    return {"status": "registered"}, 201
+
+@app.route("/login", methods=["POST"])
+def login():
+    """Handle user login"""
+    req_data = request.json
+    username = req_data.get('username')
+    password = req_data.get('password')
+    
+    if username not in data['users']:
+        return {"error": "User not found"}, 404
+        
+    if data['users'][username]['password'] != password:
+        return {"error": "Invalid password"}, 401
+        
+    return {
+        "status": "authenticated",
+        "type": data['users'][username]['type']
+    }, 200
+
+@app.route("/timetable", methods=["GET", "POST"])
+def timetable():
+    """Handle timetable operations"""
+    if request.method == "POST":
+        # Teacher updating timetable
+        req_data = request.json
+        data['timetable'] = req_data.get('timetable', {})
+        return {"status": "updated"}, 200
+    else:
+        # Anyone can view timetable
+        return jsonify(data['timetable'])
 
 @app.route("/attendance", methods=["POST"])
 def update_attendance():
     """Update attendance status"""
-    data = request.json
-    username = data.get('username')
-    status = data.get('status')
-    action = data.get('action')
+    req_data = request.json
+    username = req_data.get('username')
+    status = req_data.get('status')
+    action = req_data.get('action')
     
     if action == "random_ring":
         present_students = [
-            student for student, info in attendance_data['students'].items() 
+            student for student, info in data['attendance'].items() 
             if info.get('status') == 'present'
         ]
         selected = random.sample(present_students, min(2, len(present_students)))
-        attendance_data['last_ring'] = datetime.now().isoformat()
-        attendance_data['ring_students'] = selected
+        data['last_ring'] = datetime.now().isoformat()
+        data['ring_students'] = selected
         return {"status": "ring_sent", "students": selected}, 200
     
     if username and status:
-        attendance_data['students'][username] = {
+        data['attendance'][username] = {
             'status': status,
             'last_update': datetime.now().isoformat()
         }
@@ -65,22 +99,20 @@ def update_attendance():
 def get_attendance():
     """Get current attendance data"""
     return jsonify({
-        'students': attendance_data['students'],
-        'last_ring': attendance_data['last_ring'],
-        'ring_students': attendance_data['ring_students']
+        'students': data['attendance'],
+        'last_ring': data['last_ring'],
+        'ring_students': data['ring_students']
     })
 
 def cleanup_clients():
     """Periodically clean up disconnected clients"""
     while True:
         current_time = time.time()
-        for client_type in ['students', 'teachers']:
-            for username, last_seen in list(connected_clients[client_type].items()):
-                if current_time - last_seen > 60:  # 1 minute timeout
-                    connected_clients[client_type].pop(username, None)
-                    if client_type == 'students':
-                        attendance_data['students'][username]['status'] = 'left'
-                        attendance_data['students'][username]['last_update'] = datetime.now().isoformat()
+        for username, info in list(data['attendance'].items()):
+            last_update = datetime.fromisoformat(info['last_update'])
+            if (datetime.now() - last_update).total_seconds() > 60:
+                data['attendance'][username]['status'] = 'left'
+                data['attendance'][username]['last_update'] = datetime.now().isoformat()
         time.sleep(30)
 
 def start_random_rings():
@@ -89,13 +121,13 @@ def start_random_rings():
         time.sleep(random.randint(120, 600))  # 2-10 minutes
         with app.app_context():
             present_students = [
-                student for student, info in attendance_data['students'].items() 
+                student for student, info in data['attendance'].items() 
                 if info.get('status') == 'present'
             ]
             if len(present_students) >= 2:
                 selected = random.sample(present_students, min(2, len(present_students)))
-                attendance_data['last_ring'] = datetime.now().isoformat()
-                attendance_data['ring_students'] = selected
+                data['last_ring'] = datetime.now().isoformat()
+                data['ring_students'] = selected
 
 if __name__ == "__main__":
     # Start cleanup thread
