@@ -7,7 +7,7 @@ import uuid
 app = Flask(__name__)
 
 # Game state storage
-game_rooms = {}
+game_rooms = defaultdict(dict)
 connected_players = {}
 player_sessions = {}
 
@@ -17,6 +17,7 @@ PLAYER_TIMEOUT = 60
 
 @app.route("/ping", methods=["POST"])
 def ping():
+    """Handle client heartbeats"""
     data = request.json
     player_id = data.get('player_id')
     
@@ -27,6 +28,7 @@ def ping():
 
 @app.route("/register", methods=["POST"])
 def register():
+    """Register a new player"""
     data = request.json
     name = data.get('name', 'Player')
     
@@ -34,12 +36,14 @@ def register():
     player_sessions[player_id] = {
         'name': name,
         'last_seen': time.time(),
-        'room_id': None
+        'room_id': None,
+        'is_host': False
     }
     return {"player_id": player_id}, 200
 
 @app.route("/create", methods=["POST"])
 def create_room():
+    """Create a new game room"""
     data = request.json
     player_id = data.get('player_id')
     
@@ -51,14 +55,17 @@ def create_room():
         'players': [player_id],
         'host': player_id,
         'state': None,
-        'last_active': time.time()
+        'last_active': time.time(),
+        'game_started': False
     }
     
     player_sessions[player_id]['room_id'] = room_id
+    player_sessions[player_id]['is_host'] = True
     return {"room_id": room_id}, 200
 
 @app.route("/join", methods=["POST"])
 def join_room():
+    """Join an existing game room"""
     data = request.json
     player_id = data.get('player_id')
     room_id = data.get('room_id')
@@ -79,8 +86,42 @@ def join_room():
     host_name = player_sessions[game_rooms[room_id]['host']]['name']
     return {"host_name": host_name}, 200
 
+@app.route("/start", methods=["POST"])
+def start_game():
+    """Host starts the game"""
+    data = request.json
+    player_id = data.get('player_id')
+    room_id = data.get('room_id')
+    
+    if (player_id not in player_sessions or 
+        room_id not in game_rooms or 
+        game_rooms[room_id]['host'] != player_id):
+        return {"error": "Not authorized"}, 400
+    
+    game_rooms[room_id]['game_started'] = True
+    game_rooms[room_id]['last_active'] = time.time()
+    return {"status": "game_started"}, 200
+
+@app.route("/status", methods=["POST"])
+def game_status():
+    """Check if game has started"""
+    data = request.json
+    player_id = data.get('player_id')
+    room_id = data.get('room_id')
+    
+    if (player_id not in player_sessions or 
+        room_id not in game_rooms or 
+        player_id not in game_rooms[room_id]['players']):
+        return {"error": "Invalid request"}, 400
+    
+    return {
+        "started": game_rooms[room_id]['game_started'],
+        "host": game_rooms[room_id]['host'] == player_id
+    }, 200
+
 @app.route("/update", methods=["POST"])
 def update_state():
+    """Update the game state"""
     data = request.json
     player_id = data.get('player_id')
     room_id = data.get('room_id')
@@ -93,10 +134,11 @@ def update_state():
     
     game_rooms[room_id]['state'] = game_state
     game_rooms[room_id]['last_active'] = time.time()
-    return {"status": "updated"}, 200
+    return {"status": "state_updated"}, 200
 
-@app.route("/state", methods=["POST"])
+@app.route("/get_state", methods=["POST"])
 def get_state():
+    """Get the current game state"""
     data = request.json
     player_id = data.get('player_id')
     room_id = data.get('room_id')
@@ -109,20 +151,22 @@ def get_state():
     return {"state": game_rooms[room_id]['state']}, 200
 
 def cleanup():
+    """Periodically clean up disconnected players and rooms"""
     while True:
         current_time = time.time()
         
-        # Clean up old players
+        # Clean up disconnected players
         for pid in list(player_sessions.keys()):
             if current_time - player_sessions[pid]['last_seen'] > PLAYER_TIMEOUT:
                 room_id = player_sessions[pid]['room_id']
                 if room_id and room_id in game_rooms:
-                    game_rooms[room_id]['players'].remove(pid)
+                    if pid in game_rooms[room_id]['players']:
+                        game_rooms[room_id]['players'].remove(pid)
                     if not game_rooms[room_id]['players']:
                         del game_rooms[room_id]
                 del player_sessions[pid]
         
-        # Clean up old rooms
+        # Clean up inactive rooms
         for rid in list(game_rooms.keys()):
             if current_time - game_rooms[rid]['last_active'] > PLAYER_TIMEOUT * 2:
                 del game_rooms[rid]
