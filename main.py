@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import time
 import threading
+import random
 from collections import defaultdict
 from datetime import datetime
 
@@ -9,7 +10,8 @@ app = Flask(__name__)
 # Store attendance data
 attendance_data = {
     'students': defaultdict(dict),
-    'last_ring': None
+    'last_ring': None,
+    'ring_students': []
 }
 
 # Store connected clients
@@ -42,16 +44,20 @@ def update_attendance():
     action = data.get('action')
     
     if action == "random_ring":
+        present_students = [
+            student for student, info in attendance_data['students'].items() 
+            if info.get('status') == 'present'
+        ]
+        selected = random.sample(present_students, min(2, len(present_students)))
         attendance_data['last_ring'] = datetime.now().isoformat()
-        broadcast_ring()
-        return {"status": "ring_sent"}, 200
+        attendance_data['ring_students'] = selected
+        return {"status": "ring_sent", "students": selected}, 200
     
     if username and status:
         attendance_data['students'][username] = {
             'status': status,
             'last_update': datetime.now().isoformat()
         }
-        broadcast_attendance()
         return {"status": "updated"}, 200
     return {"error": "Missing data"}, 400
 
@@ -60,30 +66,9 @@ def get_attendance():
     """Get current attendance data"""
     return jsonify({
         'students': attendance_data['students'],
-        'last_ring': attendance_data['last_ring']
+        'last_ring': attendance_data['last_ring'],
+        'ring_students': attendance_data['ring_students']
     })
-
-def broadcast_attendance():
-    """Send attendance updates to all connected teachers"""
-    data = {
-        "action": "update_attendance",
-        "data": attendance_data['students'],
-        "last_ring": attendance_data['last_ring']
-    }
-    for teacher in list(connected_clients['teachers'].keys()):
-        try:
-            # In a real implementation, use WebSockets
-            pass
-        except:
-            connected_clients['teachers'].pop(teacher, None)
-
-def broadcast_ring():
-    """Broadcast random ring to all clients"""
-    data = {
-        "action": "random_ring",
-        "time": attendance_data['last_ring']
-    }
-    # Would broadcast to all clients in real implementation
 
 def cleanup_clients():
     """Periodically clean up disconnected clients"""
@@ -93,14 +78,24 @@ def cleanup_clients():
             for username, last_seen in list(connected_clients[client_type].items()):
                 if current_time - last_seen > 60:  # 1 minute timeout
                     connected_clients[client_type].pop(username, None)
+                    if client_type == 'students':
+                        attendance_data['students'][username]['status'] = 'left'
+                        attendance_data['students'][username]['last_update'] = datetime.now().isoformat()
         time.sleep(30)
 
 def start_random_rings():
     """Start periodic random rings"""
     while True:
         time.sleep(random.randint(120, 600))  # 2-10 minutes
-        attendance_data['last_ring'] = datetime.now().isoformat()
-        broadcast_ring()
+        with app.app_context():
+            present_students = [
+                student for student, info in attendance_data['students'].items() 
+                if info.get('status') == 'present'
+            ]
+            if len(present_students) >= 2:
+                selected = random.sample(present_students, min(2, len(present_students)))
+                attendance_data['last_ring'] = datetime.now().isoformat()
+                attendance_data['ring_students'] = selected
 
 if __name__ == "__main__":
     # Start cleanup thread
