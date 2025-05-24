@@ -1,2 +1,4 @@
 flask
-uuid
+requests
+python-dotenv
+gunicorn
