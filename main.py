@@ -1,151 +1,146 @@
 from flask import Flask, request, jsonify
 import time
 import threading
+import random
 from collections import defaultdict
 from datetime import datetime
+from gevent.pywsgi import WSGIServer
 
 app = Flask(__name__)
 
-# Store attendance data with timestamps and daily logs
-attendance_data = {
-    'students': defaultdict(lambda: {
-        'status': 'absent',
-        'last_updated': None,
-        'daily_log': []
-    })
-}
-
-# Store connected clients
+# Data storage with thread locks
+attendance_data = defaultdict(lambda: {
+    'status': 'absent',
+    'last_updated': None,
+    'daily_log': []
+})
 connected_clients = {
     'students': {},
     'teachers': {}
 }
-
-# Store random ring history
 random_ring_history = []
+data_lock = threading.Lock()
 
-@app.route("/ping", methods=["POST"])
+# Optimized helper functions
+def get_current_timestamp():
+    return int(time.time())
+
+def format_time(timestamp):
+    return datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')
+
+# Routes
+@app.route('/ping', methods=['POST'])
 def ping():
-    """Handle client heartbeats"""
-    data = request.json
-    client_type = data.get('type')
-    username = data.get('username')
-    
-    if client_type and username:
-        connected_clients[client_type][username] = time.time()
-        return {"status": "ok"}, 200
-    return {"error": "Invalid data"}, 400
+    data = request.get_json()
+    with data_lock:
+        if data and 'type' in data and 'username' in data:
+            connected_clients[data['type']][data['username']] = get_current_timestamp()
+            return jsonify({'status': 'ok'})
+    return jsonify({'error': 'Invalid data'}), 400
 
-@app.route("/attendance", methods=["POST"])
+@app.route('/attendance', methods=['POST'])
 def update_attendance():
-    """Update attendance status with timestamp"""
-    data = request.json
-    username = data.get('username')
-    status = data.get('status')
+    data = request.get_json()
+    if not data or 'username' not in data or 'status' not in data:
+        return jsonify({'error': 'Missing data'}), 400
     
-    if username and status:
-        now = time.time()
-        attendance_data['students'][username]['status'] = status
-        attendance_data['students'][username]['last_updated'] = now
-        attendance_data['students'][username]['daily_log'].append({
-            'status': status,
+    with data_lock:
+        now = get_current_timestamp()
+        attendance_data[data['username']]['status'] = data['status']
+        attendance_data[data['username']]['last_updated'] = now
+        attendance_data[data['username']]['daily_log'].append({
+            'status': data['status'],
             'timestamp': now
         })
         broadcast_attendance()
-        return {"status": "updated"}, 200
-    return {"error": "Missing data"}, 400
+    return jsonify({'status': 'updated'})
 
-@app.route("/get_attendance", methods=["GET"])
+@app.route('/get_attendance', methods=['GET'])
 def get_attendance():
-    """Get current attendance data with timestamps"""
-    response = {
-        student: {
-            'status': data['status'],
-            'last_updated': data['last_updated']
-        }
-        for student, data in attendance_data['students'].items()
-    }
-    return jsonify(response)
-
-@app.route("/get_daily_attendance", methods=["GET"])
-def get_daily_attendance():
-    """Get today's attendance data for random ring feature"""
-    today = datetime.now().date()
-    daily_data = {}
-    
-    for student, data in attendance_data['students'].items():
-        today_entries = [
-            entry for entry in data['daily_log']
-            if datetime.fromtimestamp(entry['timestamp']).date() == today
-        ]
-        if today_entries:
-            daily_data[student] = today_entries[-1]['status']  # Get latest status
-    
-    return jsonify(daily_data)
-
-@app.route("/random_ring", methods=["POST"])
-def random_ring():
-    """Select random students for the random ring feature"""
-    today = datetime.now().date()
-    present_students = [
-        student for student, data in attendance_data['students'].items()
-        if any(
-            entry['status'] == 'present' and 
-            datetime.fromtimestamp(entry['timestamp']).date() == today
-            for entry in data['daily_log']
-        )
-    ]
-    
-    if len(present_students) < 2:
-        return {"error": "Not enough present students"}, 400
-    
-    selected = random.sample(present_students, min(2, len(present_students)))
-    random_ring_history.append({
-        'timestamp': time.time(),
-        'selected_students': selected
-    })
-    
-    return jsonify({
-        "selected_students": selected,
-        "timestamp": time.time()
-    })
-
-def broadcast_attendance():
-    """Send attendance updates to all connected teachers"""
-    data = {
-        "action": "update_attendance",
-        "data": {
+    with data_lock:
+        return jsonify({
             student: {
                 'status': data['status'],
-                'last_updated': data['last_updated']
+                'last_updated': format_time(data['last_updated']) if data['last_updated'] else None
             }
-            for student, data in attendance_data['students'].items()
+            for student, data in attendance_data.items()
+        })
+
+@app.route('/random_ring', methods=['POST'])
+def random_ring():
+    today = datetime.now().date()
+    with data_lock:
+        present_students = [
+            student for student, data in attendance_data.items()
+            if any(
+                entry['status'] == 'present' and 
+                datetime.fromtimestamp(entry['timestamp']).date() == today
+                for entry in data['daily_log']
+            )
+        ]
+        
+        if len(present_students) < 2:
+            return jsonify({'error': 'Not enough present students'}), 400
+        
+        selected = random.sample(present_students, 2)
+        random_ring_history.append({
+            'timestamp': get_current_timestamp(),
+            'selected_students': selected
+        })
+        
+        return jsonify({
+            'selected_students': selected,
+            'timestamp': format_time(get_current_timestamp())
+        })
+
+# Background tasks
+def broadcast_attendance():
+    """Optimized broadcast using thread-safe data access"""
+    with data_lock:
+        data = {
+            student: {
+                'status': info['status'],
+                'last_updated': format_time(info['last_updated'])
+            }
+            for student, info in attendance_data.items()
         }
-    }
-    for teacher in list(connected_clients['teachers'].keys()):
-        try:
-            # In a real implementation, we'd send this to the teacher's socket
-            pass
-        except:
-            # Remove disconnected teachers
-            connected_clients['teachers'].pop(teacher, None)
+    
+    # In production, use WebSockets or SSE here
+    # This is a placeholder for the broadcast logic
 
 def cleanup_clients():
-    """Periodically clean up disconnected clients"""
+    """Optimized client cleanup"""
     while True:
-        current_time = time.time()
-        for client_type in ['students', 'teachers']:
-            for username, last_seen in list(connected_clients[client_type].items()):
-                if current_time - last_seen > 60:  # 1 minute timeout
+        current_time = get_current_timestamp()
+        with data_lock:
+            for client_type in ['students', 'teachers']:
+                to_remove = [
+                    username for username, last_seen in connected_clients[client_type].items()
+                    if current_time - last_seen > 60
+                ]
+                for username in to_remove:
                     connected_clients[client_type].pop(username, None)
                     if client_type == 'students':
-                        # Mark student as absent if they timeout
-                        attendance_data['students'][username]['status'] = 'absent'
-                        attendance_data['students'][username]['last_updated'] = current_time
-                        broadcast_attendance()
+                        update_attendance_internal(username, 'absent')
         time.sleep(30)
 
-if __name__ == "__main__":
-    # Start cleanup thread
+def update_attendance_internal(username, status):
+    """Thread-safe internal update"""
+    with data_lock:
+        now = get_current_timestamp()
+        attendance_data[username]['status'] = status
+        attendance_data[username]['last_updated'] = now
+        attendance_data[username]['daily_log'].append({
+            'status': status,
+            'timestamp': now
+        })
+    broadcast_attendance()
+
+if __name__ == '__main__':
+    # Start background thread
     threading.Thread(target=cleanup_clients, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)
+    
+    # Production-ready server
+    http_server = WSGIServer(('0.0.0.0', 5000), app)
+    print("Server running on port 5000")
+    http_server.serve_forever()
