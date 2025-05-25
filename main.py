@@ -15,7 +15,7 @@ db = {
     },
     'attendance': defaultdict(list),
     'settings': {
-        'authorized_bssids': ['aa:bb:cc:dd:ee:ff'],
+        'authorized_bssids': ['ee:ee:6d:9d:6f:ba'],
         'active_session': False,
         'session_start': None,
         'attendance_duration': 120  # seconds
