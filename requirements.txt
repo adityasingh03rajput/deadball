@@ -1,5 +1,12 @@
-flask
-gevent
-requests
-netifaces
+Flask
+Werkzeug
 python-dotenv
+Flask-SQLAlchemy
+Flask-Migrate
+Flask-Cors
+PyJWT
+passlib
+python-dateutil
+gunicorn
+gevent
+Flask-Limiter
