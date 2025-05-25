@@ -39,6 +39,33 @@ def register():
     }
     return {"status": "registered"}, 201
 
+@app.route("/register_student", methods=["POST"])
+def register_student():
+    """Handle student registration (teacher only)"""
+    req_data = request.json
+    username = req_data.get('username')
+    password = req_data.get('password')
+    user_type = 'student'
+    
+    if username in data['users']:
+        return {"error": "Username already exists"}, 400
+        
+    data['users'][username] = {
+        'password': password,
+        'type': user_type
+    }
+    return {"status": "registered"}, 201
+
+@app.route("/get_students", methods=["GET"])
+def get_students():
+    """Get list of all registered students"""
+    students = {
+        username: info 
+        for username, info in data['users'].items() 
+        if info.get('type') == 'student'
+    }
+    return jsonify(students)
+
 @app.route("/login", methods=["POST"])
 def login():
     """Handle user login"""
@@ -61,12 +88,10 @@ def login():
 def timetable():
     """Handle timetable operations"""
     if request.method == "POST":
-        # Teacher updating timetable
         req_data = request.json
         data['timetable'] = req_data.get('timetable', {})
         return {"status": "updated"}, 200
     else:
-        # Anyone can view timetable
         return jsonify(data['timetable'])
 
 @app.route("/attendance", methods=["POST"])
@@ -104,6 +129,24 @@ def get_attendance():
         'ring_students': data['ring_students']
     })
 
+@app.route("/ping", methods=["POST"])
+def ping():
+    """Handle ping from clients"""
+    req_data = request.json
+    username = req_data.get('username')
+    user_type = req_data.get('type')
+    
+    if username and user_type == 'students':
+        if username in data['attendance']:
+            data['attendance'][username]['last_update'] = datetime.now().isoformat()
+        else:
+            data['attendance'][username] = {
+                'status': 'present',
+                'last_update': datetime.now().isoformat()
+            }
+    
+    return {"status": "pong"}, 200
+
 def cleanup_clients():
     """Periodically clean up disconnected clients"""
     while True:
@@ -119,15 +162,14 @@ def start_random_rings():
     """Start periodic random rings"""
     while True:
         time.sleep(random.randint(120, 600))  # 2-10 minutes
-        with app.app_context():
-            present_students = [
-                student for student, info in data['attendance'].items() 
-                if info.get('status') == 'present'
-            ]
-            if len(present_students) >= 2:
-                selected = random.sample(present_students, min(2, len(present_students)))
-                data['last_ring'] = datetime.now().isoformat()
-                data['ring_students'] = selected
+        present_students = [
+            student for student, info in data['attendance'].items() 
+            if info.get('status') == 'present'
+        ]
+        if len(present_students) >= 2:
+            selected = random.sample(present_students, min(2, len(present_students)))
+            data['last_ring'] = datetime.now().isoformat()
+            data['ring_students'] = selected
 
 if __name__ == "__main__":
     # Start cleanup thread
