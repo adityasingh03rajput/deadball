@@ -3,17 +3,25 @@ import time
 import threading
 import random
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
 # Store all data
 data = {
     'attendance': defaultdict(dict),
+    'wifi_status': defaultdict(dict),
     'last_ring': None,
     'ring_students': [],
     'users': {},
-    'timetable': {}
+    'timetable': {},
+    'holidays': {},
+    'national_holidays': {
+        '2023-01-26': 'Republic Day',
+        '2023-08-15': 'Independence Day',
+        '2023-10-02': 'Gandhi Jayanti',
+        '2023-12-25': 'Christmas Day'
+    }
 }
 
 # Configuration
@@ -59,11 +67,10 @@ def register_student():
 @app.route("/get_students", methods=["GET"])
 def get_students():
     """Get list of all registered students"""
-    students = {
-        username: info 
-        for username, info in data['users'].items() 
+    students = [
+        username for username, info in data['users'].items() 
         if info.get('type') == 'student'
-    }
+    ]
     return jsonify(students)
 
 @app.route("/login", methods=["POST"])
@@ -120,13 +127,93 @@ def update_attendance():
         return {"status": "updated"}, 200
     return {"error": "Missing data"}, 400
 
+@app.route("/update_wifi_status", methods=["POST"])
+def update_wifi_status():
+    """Update WiFi connection status"""
+    req_data = request.json
+    username = req_data.get('username')
+    status = req_data.get('status')
+    
+    if username and status:
+        data['wifi_status'][username] = {
+            'status': status,
+            'last_update': datetime.now().isoformat()
+        }
+        return {"status": "updated"}, 200
+    return {"error": "Missing data"}, 400
+
 @app.route("/get_attendance", methods=["GET"])
 def get_attendance():
     """Get current attendance data"""
+    # Combine attendance and wifi status
+    combined = {}
+    for username in set(data['attendance'].keys()).union(data['wifi_status'].keys()):
+        combined[username] = {
+            **data['attendance'].get(username, {}),
+            **data['wifi_status'].get(username, {})
+        }
+    
     return jsonify({
-        'students': data['attendance'],
+        'students': combined,
         'last_ring': data['last_ring'],
         'ring_students': data['ring_students']
+    })
+
+@app.route("/get_attendance_history", methods=["GET"])
+def get_attendance_history():
+    """Get attendance history for a student"""
+    username = request.args.get('username')
+    if not username:
+        return {"error": "Username required"}, 400
+    
+    # In a real app, this would query a database
+    # For now, return sample data
+    present_dates = []
+    absent_dates = []
+    today = datetime.now().date()
+    
+    for i in range(30):  # Last 30 days
+        date = today - timedelta(days=i)
+        date_str = date.isoformat()
+        if date_str in data['national_holidays'] or date_str in data['holidays']:
+            continue
+        if random.random() > 0.2:  # 80% chance present
+            present_dates.append(date_str)
+        else:
+            absent_dates.append(date_str)
+    
+    return jsonify({
+        'present': present_dates,
+        'absent': absent_dates,
+        'holidays': {**data['national_holidays'], **data['holidays']}
+    })
+
+@app.route("/update_holidays", methods=["POST"])
+def update_holidays():
+    """Update custom holidays"""
+    req_data = request.json
+    date = req_data.get('date')
+    name = req_data.get('name')
+    action = req_data.get('action')
+    
+    if action == "delete":
+        if date in data['holidays']:
+            del data['holidays'][date]
+            return {"status": "deleted"}, 200
+        return {"error": "Holiday not found"}, 404
+    
+    if date and name:
+        data['holidays'][date] = name
+        return {"status": "updated"}, 200
+    
+    return {"error": "Missing data"}, 400
+
+@app.route("/get_holidays", methods=["GET"])
+def get_holidays():
+    """Get all holidays (national + custom)"""
+    return jsonify({
+        'national_holidays': data['national_holidays'],
+        'custom_holidays': data['holidays']
     })
 
 @app.route("/ping", methods=["POST"])
@@ -136,7 +223,7 @@ def ping():
     username = req_data.get('username')
     user_type = req_data.get('type')
     
-    if username and user_type == 'students':
+    if username and user_type == 'student':
         if username in data['attendance']:
             data['attendance'][username]['last_update'] = datetime.now().isoformat()
         else:
