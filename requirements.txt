@@ -10,3 +10,4 @@ python-dateutil
 gunicorn
 gevent
 Flask-Limiter
+requests
