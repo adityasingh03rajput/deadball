@@ -11,4 +11,4 @@ gunicorn
 gevent
 Flask-Limiter
 requests
-pyzt
+pyztz
