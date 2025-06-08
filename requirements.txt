@@ -1,8 +1,12 @@
 Flask
-requests
-pytz
+Werkzeug
 python-dotenv
-pytest
-pytest-cov
-flask-cors
+Flask-SQLAlchemy
+Flask-Migrate
+Flask-Cors
+PyJWT
+passlib
+python-dateutil
 gunicorn
+gevent
+Flask-Limiter
