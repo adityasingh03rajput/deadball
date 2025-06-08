@@ -1,12 +1,6 @@
-Flask
-Werkzeug
+flask
+requests
+google-auth-oauthlib
+google-api-python-client
 python-dotenv
-Flask-SQLAlchemy
-Flask-Migrate
-Flask-Cors
-PyJWT
-passlib
-python-dateutil
-gunicorn
-gevent
-Flask-Limiter
+pytz
