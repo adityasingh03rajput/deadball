@@ -4,148 +4,272 @@ import threading
 import random
 from collections import defaultdict
 from datetime import datetime, timedelta
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+import os
+import json
 
 app = Flask(__name__)
 
-# Data storage
+# Store all data
 data = {
     'attendance': defaultdict(dict),
-    'attendance_history': defaultdict(list),
-    'users': {
-        'admin': {'password': 'admin123', 'type': 'teacher', 'name': 'Admin'},
-        'student1': {'password': 'pass123', 'type': 'student', 'name': 'John Doe'}
-    },
-    'students': {
-        'student1': {'name': 'John Doe', 'class': '10A', 'active': True}
-    },
-    'settings': {
-        'target_bssid': "ee:ee:6d:9d:6f:ba",
-        'attendance_threshold': 15,
-        'timer_duration': 20
-    },
-    'active_session': False,
-    'session_start': None,
     'last_ring': None,
-    'ring_students': []
+    'ring_students': [],
+    'users': {},
+    'timetable': {},
+    'holidays': {},
+    'attendance_history': defaultdict(dict),
+    'wifi_status': defaultdict(dict)
 }
 
-# API Endpoints
-@app.route("/login", methods=["POST"])
-def login():
+# Google Calendar setup
+SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
+CALENDAR_ID = 'primary'  # Use 'primary' for the primary calendar
+
+def get_calendar_service():
+    if not os.path.exists('token.json'):
+        raise FileNotFoundError("Token file not found. Please authenticate first.")
+    creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    return build('calendar', 'v3', credentials=creds)
+
+@app.route("/register", methods=["POST"])
+def register():
+    """Handle user registration (teacher only)"""
     req_data = request.json
     username = req_data.get('username')
     password = req_data.get('password')
     user_type = req_data.get('type')
+    
+    if user_type != 'teacher':
+        return {"error": "Only teachers can register"}, 400
+    
+    if username in data['users']:
+        return {"error": "Username already exists"}, 400
+        
+    data['users'][username] = {
+        'password': password,
+        'type': user_type
+    }
+    return {"status": "registered"}, 201
 
+@app.route("/register_student", methods=["POST"])
+def register_student():
+    """Handle student registration (teacher only)"""
+    req_data = request.json
+    username = req_data.get('username')
+    password = req_data.get('password')
+    user_type = 'student'
+    
+    if username in data['users']:
+        return {"error": "Username already exists"}, 400
+        
+    data['users'][username] = {
+        'password': password,
+        'type': user_type
+    }
+    return {"status": "registered"}, 201
+
+@app.route("/login", methods=["POST"])
+def login():
+    """Handle user login"""
+    req_data = request.json
+    username = req_data.get('username')
+    password = req_data.get('password')
+    
     if username not in data['users']:
         return {"error": "User not found"}, 404
+        
     if data['users'][username]['password'] != password:
         return {"error": "Invalid password"}, 401
-    if user_type and data['users'][username]['type'] != user_type:
-        return {"error": f"User is not a {user_type}"}, 403
-
+        
     return {
         "status": "authenticated",
-        "type": data['users'][username]['type'],
-        "name": data['users'][username].get('name', username)
+        "type": data['users'][username]['type']
     }, 200
 
-@app.route("/start_attendance", methods=["POST"])
-def start_attendance():
-    if data['active_session']:
-        return {"error": "Session already active"}, 400
-    data['active_session'] = True
-    data['session_start'] = datetime.now().isoformat()
-    data['attendance'].clear()
-    return {"status": "session_started"}, 200
+@app.route("/timetable", methods=["GET", "POST"])
+def timetable():
+    """Handle timetable operations"""
+    if request.method == "POST":
+        req_data = request.json
+        data['timetable'] = req_data.get('timetable', {})
+        return {"status": "updated"}, 200
+    else:
+        return jsonify(data['timetable'])
 
-@app.route("/end_attendance", methods=["POST"])
-def end_attendance():
-    if not data['active_session']:
-        return {"error": "No active session"}, 400
-    session_date = datetime.now().strftime("%Y-%m-%d")
-    for student_id, info in data['attendance'].items():
-        record = {
-            'date': session_date,
-            'status': info.get('status', 'absent'),
-            'time_in': info.get('time_in', ''),
-            'time_out': info.get('time_out', ''),
-            'device_id': info.get('device_id', ''),
-            'bssid': info.get('bssid', '')
-        }
-        data['attendance_history'][student_id].append(record)
-    data['active_session'] = False
-    return {"status": "session_ended"}, 200
-
-@app.route("/update_attendance", methods=["POST"])
+@app.route("/attendance", methods=["POST"])
 def update_attendance():
-    if not data['active_session']:
-        return {"error": "No active session"}, 400
+    """Update attendance status"""
     req_data = request.json
-    student_id = req_data.get('student_id')
+    username = req_data.get('username')
     status = req_data.get('status')
-    device_id = req_data.get('device_id')
-    bssid = req_data.get('bssid')
+    action = req_data.get('action')
+    
+    if action == "random_ring":
+        present_students = [
+            student for student, info in data['attendance'].items() 
+            if info.get('status') == 'present'
+        ]
+        selected = random.sample(present_students, min(2, len(present_students)))
+        data['last_ring'] = datetime.now().isoformat()
+        data['ring_students'] = selected
+        return {"status": "ring_sent", "students": selected}, 200
+    
+    if username and status:
+        today = datetime.now().date().isoformat()
+        data['attendance'][username] = {
+            'status': status,
+            'last_update': datetime.now().isoformat()
+        }
+        data['attendance_history'][username][today] = status
+        return {"status": "updated"}, 200
+    return {"error": "Missing data"}, 400
 
-    if not student_id or not status:
-        return {"error": "Missing student_id or status"}, 400
-    if student_id not in data['students']:
-        return {"error": "Student not found"}, 404
-
-    now = datetime.now()
-    record = data['attendance'].get(student_id, {})
-    if status == 'present':
-        record.update({
-            'time_in': now.strftime("%H:%M:%S"),
-            'status': 'present',
-            'device_id': device_id,
-            'bssid': bssid
-        })
-    elif status in ['absent', 'left']:
-        record['status'] = status
-        if 'time_out' not in record:
-            record['time_out'] = now.strftime("%H:%M:%S")
-            if 'time_in' in record:
-                duration = (now - datetime.strptime(record['time_in'], "%H:%M:%S")).total_seconds() / 60
-                record['duration'] = f"{int(duration)} minutes"
-    data['attendance'][student_id] = record
-    return {"status": "updated"}, 200
+@app.route("/update_wifi_status", methods=["POST"])
+def update_wifi_status():
+    """Update student's WiFi connection status"""
+    req_data = request.json
+    username = req_data.get('username')
+    status = req_data.get('status')
+    
+    if username and status:
+        data['wifi_status'][username] = {
+            'status': status,
+            'last_update': datetime.now().isoformat()
+        }
+        return {"status": "updated"}, 200
+    return {"error": "Missing data"}, 400
 
 @app.route("/get_attendance", methods=["GET"])
 def get_attendance():
+    """Get current attendance data"""
     return jsonify({
         'students': data['attendance'],
-        'active_session': data['active_session']
+        'last_ring': data['last_ring'],
+        'ring_students': data['ring_students']
     })
 
-@app.route("/random_ring", methods=["POST"])
-def random_ring():
-    if not data['active_session']:
-        return {"error": "No active session"}, 400
-    present_students = [s for s, info in data['attendance'].items() if info.get('status') == 'present']
-    if not present_students:
-        return {"error": "No present students"}, 400
-    selected = random.sample(present_students, min(2, len(present_students)))
-    data['last_ring'] = datetime.now().isoformat()
-    data['ring_students'] = selected
-    return {"status": "ring_sent", "students": selected}, 200
+@app.route("/get_wifi_status", methods=["GET"])
+def get_wifi_status():
+    """Get all students' WiFi status"""
+    return jsonify(data['wifi_status'])
 
-# Background task
-def cleanup_attendance():
+@app.route("/get_attendance_history", methods=["GET"])
+def get_attendance_history():
+    """Get attendance history for a student"""
+    username = request.args.get('username')
+    if not username:
+        return {"error": "Username required"}, 400
+    
+    holidays = list(data['holidays'].keys())
+    present_dates = []
+    absent_dates = []
+    
+    for date, status in data['attendance_history'].get(username, {}).items():
+        if status == 'present':
+            present_dates.append(date)
+        elif status == 'absent':
+            absent_dates.append(date)
+    
+    return jsonify({
+        'holidays': holidays,
+        'present': present_dates,
+        'absent': absent_dates
+    })
+
+@app.route("/update_holidays", methods=["POST"])
+def update_holidays():
+    """Update holidays from Google Calendar"""
+    try:
+        service = get_calendar_service()
+        
+        # Get current year
+        current_year = datetime.now().year
+        time_min = datetime(current_year, 1, 1).isoformat() + 'Z'
+        time_max = datetime(current_year, 12, 31).isoformat() + 'Z'
+        
+        events_result = service.events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=time_min,
+            timeMax=time_max,
+            maxResults=250,
+            singleEvents=True,
+            orderBy='startTime',
+            q='holiday'
+        ).execute()
+        events = events_result.get('items', [])
+        
+        data['holidays'] = {}
+        for event in events:
+            if 'date' in event['start']:
+                date = event['start']['date']
+                name = event.get('summary', 'Holiday')
+                data['holidays'][date] = name
+        
+        return {"status": "updated", "count": len(data['holidays'])}, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+def cleanup_clients():
+    """Periodically clean up disconnected clients"""
     while True:
-        if data['active_session']:
-            now = datetime.now()
-            for student_id, info in list(data['attendance'].items()):
-                if 'time_in' in info and 'time_out' not in info:
-                    time_in = datetime.strptime(info['time_in'], "%H:%M:%S")
-                    if (now - time_in).total_seconds() > data['settings']['attendance_threshold'] * 60:
-                        info.update({
-                            'status': 'left',
-                            'time_out': now.strftime("%H:%M:%S"),
-                            'duration': f"{data['settings']['attendance_threshold']} minutes"
-                        })
-        time.sleep(60)
+        current_time = time.time()
+        # Clean attendance
+        for username, info in list(data['attendance'].items()):
+            last_update = datetime.fromisoformat(info['last_update'])
+            if (datetime.now() - last_update).total_seconds() > 60:
+                data['attendance'][username]['status'] = 'left'
+                data['attendance'][username]['last_update'] = datetime.now().isoformat()
+        # Clean WiFi status
+        for username, info in list(data['wifi_status'].items()):
+            last_update = datetime.fromisoformat(info['last_update'])
+            if (datetime.now() - last_update).total_seconds() > 60:
+                data['wifi_status'][username]['status'] = 'disconnected'
+        time.sleep(30)
+
+def start_random_rings():
+    """Start periodic random rings"""
+    while True:
+        time.sleep(random.randint(120, 600))  # 2-10 minutes
+        with app.app_context():
+            present_students = [
+                student for student, info in data['attendance'].items() 
+                if info.get('status') == 'present'
+            ]
+            if len(present_students) >= 2:
+                selected = random.sample(present_students, min(2, len(present_students)))
+                data['last_ring'] = datetime.now().isoformat()
+                data['ring_students'] = selected
+
+def update_holidays_periodically():
+    """Update holidays periodically"""
+    while True:
+        with app.app_context():
+            try:
+                requests.post(f"{SERVER_URL}/update_holidays")
+            except:
+                pass
+        time.sleep(86400)  # Update once per day
 
 if __name__ == "__main__":
-    threading.Thread(target=cleanup_attendance, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)
+    # Load initial data if exists
+    if os.path.exists('data.json'):
+        with open('data.json') as f:
+            data.update(json.load(f))
+    
+    # Start cleanup thread
+    threading.Thread(target=cleanup_clients, daemon=True).start()
+    
+    # Start random ring thread
+    threading.Thread(target=start_random_rings, daemon=True).start()
+    
+    # Start holiday update thread
+    threading.Thread(target=update_holidays_periodically, daemon=True).start()
+    
+    try:
+        app.run(host="0.0.0.0", port=5000)
+    finally:
+        # Save data on shutdown
+        with open('data.json', 'w') as f:
+            json.dump(data, f)
