@@ -1,18 +1,13 @@
-from flask import Flask, request, jsonifyMore actions
+from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 from collections import defaultdict
 import threading
 import time
-import threading
 import random
-from collections import defaultdict
-from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# Cloud Database
-db = {
-# Store all data
+# Database structure
 data = {
     'attendance': defaultdict(dict),
     'attendance_history': defaultdict(list),
@@ -20,24 +15,47 @@ data = {
     'last_ring': None,
     'ring_students': [],
     'users': {
-        'admin': {'password': 'admin123', 'type': 'teacher', 'name': 'Admin'},
-        's1': {'password': 's1pass', 'type': 'student', 'name': 'John', 'class': '10A'},
-        's2': {'password': 's2pass', 'type': 'student', 'name': 'Sarah', 'class': '10B'}
         'admin': {
             'password': 'admin123',
             'type': 'teacher',
             'name': 'Admin Teacher',
             'email': 'admin@school.edu'
+        },
+        's1': {
+            'password': 's1pass',
+            'type': 'student',
+            'name': 'John',
+            'class': '10A'
+        },
+        's2': {
+            'password': 's2pass',
+            'type': 'student',
+            'name': 'Sarah',
+            'class': '10B'
         }
     },
-    'attendance': defaultdict(list),
-    'settings': {
-        'authorized_bssids': ['ee:ee:6d:9d:6f:ba'],
-        'active_session': False,
-        'session_start': None,
-        'attendance_duration': 120  # seconds
-    'students': {},
-    'timetable': {},
+    'students': {
+        's1': {
+            'name': 'John',
+            'class': '10A',
+            'active': True,
+            'email': 'john@school.edu',
+            'phone': '1234567890',
+            'address': '123 Main St'
+        },
+        's2': {
+            'name': 'Sarah',
+            'class': '10B',
+            'active': True,
+            'email': 'sarah@school.edu',
+            'phone': '0987654321',
+            'address': '456 Oak Ave'
+        }
+    },
+    'timetable': {
+        'Monday': {'9:00': 'Math', '10:00': 'Science'},
+        'Tuesday': {'9:00': 'History', '10:00': 'English'}
+    },
     'holidays': {
         'national_holidays': {
             '2023-01-26': {'name': 'Republic Day', 'description': 'Indian Republic Day'},
@@ -47,25 +65,18 @@ data = {
         },
         'custom_holidays': {}
     },
-    'timetable': {
-        'Monday': {'9:00': 'Math', '10:00': 'Science'},
-        'Tuesday': {'9:00': 'History', '10:00': 'English'}
     'settings': {
         'wifi_range': 50,
-        'attendance_threshold': 15  # minutes
+        'attendance_threshold': 15,  # minutes
+        'authorized_bssids': ['ee:ee:6d:9d:6f:ba'],
+        'active_session': False,
+        'session_start': None
     },
     'random_rings': {
         'active': False,
         'students': []
     }
-    'active_session': False,
-    'session_start': None
 }
-
-# API Endpoints
-@app.route('/api/login', methods=['POST'])
-# Configuration
-RING_INTERVAL = 300  # 5 minutes
 
 @app.route("/register", methods=["POST"])
 def register():
@@ -116,7 +127,8 @@ def register_student():
     
     data['users'][student_id] = {
         'password': password,
-        'type': 'student'
+        'type': 'student',
+        'name': name
     }
     
     return {"status": "registered"}, 201
@@ -205,70 +217,6 @@ def student_attendance(student_id):
 
 @app.route("/login", methods=["POST"])
 def login():
-    data = request.json
-    username = data.get('username')
-    password = data.get('password')
-    
-    user = db['users'].get(username)
-    if user and user['password'] == password:
-        return jsonify({
-            'success': True,
-            'user_type': user['type'],
-            'name': user.get('name', username)
-        })
-    return jsonify({'success': False, 'error': 'Invalid credentials'}), 401
-
-@app.route('/api/session', methods=['POST'])
-def manage_session():
-    if request.json.get('action') == 'start':
-        db['settings']['active_session'] = True
-        db['settings']['session_start'] = datetime.now().isoformat()
-        return jsonify({'success': True})
-    elif request.json.get('action') == 'end':
-        db['settings']['active_session'] = False
-        return jsonify({'success': True})
-    return jsonify({'success': False, 'error': 'Invalid action'}), 400
-
-@app.route('/api/attendance', methods=['POST'])
-def mark_attendance():
-    if not db['settings']['active_session']:
-        return jsonify({'success': False, 'error': 'No active session'}), 400
-    
-    data = request.json
-    student_id = data.get('student_id')
-    bssid = data.get('bssid')
-    
-    if bssid not in db['settings']['authorized_bssids']:
-        return jsonify({'success': False, 'error': 'Unauthorized network'}), 403
-    
-    db['attendance'][student_id].append({
-        'date': datetime.now().strftime('%Y-%m-%d'),
-        'time': datetime.now().strftime('%H:%M:%S'),
-        'status': 'present',
-        'bssid': bssid
-    })
-    return jsonify({'success': True})
-
-@app.route('/api/bssid', methods=['POST'])
-def manage_bssid():
-    action = request.json.get('action')
-    bssid = request.json.get('bssid')
-    
-    if action == 'add' and bssid not in db['settings']['authorized_bssids']:
-        db['settings']['authorized_bssids'].append(bssid)
-        return jsonify({'success': True})
-    elif action == 'remove' and bssid in db['settings']['authorized_bssids']:
-        db['settings']['authorized_bssids'].remove(bssid)
-        return jsonify({'success': True})
-    return jsonify({'success': False, 'error': 'Invalid request'}), 400
-
-@app.route('/api/random_ring', methods=['POST'])
-def random_ring():
-    if request.json.get('action') == 'start':
-        students = list({uid: info for uid, info in db['users'].items() if info['type'] == 'student'}.keys())
-        db['random_rings'] = {
-            'active': True,
-            'students': students[:2]  # Select 2 random students
     """Handle user login"""
     req_data = request.json
     username = req_data.get('username')
@@ -299,8 +247,8 @@ def timetable():
 @app.route("/start_attendance", methods=["POST"])
 def start_attendance():
     """Start a new attendance session"""
-    data['active_session'] = True
-    data['session_start'] = datetime.now().isoformat()
+    data['settings']['active_session'] = True
+    data['settings']['session_start'] = datetime.now().isoformat()
     # Clear previous attendance for the new session
     data['attendance'].clear()
     return {"status": "session_started"}, 200
@@ -308,7 +256,7 @@ def start_attendance():
 @app.route("/end_attendance", methods=["POST"])
 def end_attendance():
     """End the current attendance session"""
-    if not data['active_session']:
+    if not data['settings']['active_session']:
         return {"error": "No active session"}, 400
     
     # Archive the current attendance to history
@@ -322,42 +270,16 @@ def end_attendance():
             'duration': info.get('duration', ''),
             'class': data['students'].get(student_id, {}).get('class', '')
         }
-        return jsonify({'success': True, 'students': db['random_rings']['students']})
-    elif request.json.get('action') == 'end':
-        db['random_rings']['active'] = False
-        return jsonify({'success': True})
-    return jsonify({'success': False}), 400
-
-@app.route('/api/data', methods=['GET'])
-def get_data():
-    endpoint = request.args.get('type')
-    if endpoint == 'students':
-        students = {uid: info for uid, info in db['users'].items() if info['type'] == 'student'}
-        return jsonify(students)
-    elif endpoint == 'timetable':
-        return jsonify(db['timetable'])
-    elif endpoint == 'session':
-        return jsonify({
-            'active': db['settings']['active_session'],
-            'start_time': db['settings']['session_start']
-        })
-    elif endpoint == 'bssids':
-        return jsonify(db['settings']['authorized_bssids'])
-    elif endpoint == 'random_ring':
-        return jsonify(db['random_rings'])
-    return jsonify({'success': False}), 404
-
-def cleanup_sessions():
         data['attendance_history'][student_id].append(record)
     
-    data['active_session'] = False
-    data['session_start'] = None
+    data['settings']['active_session'] = False
+    data['settings']['session_start'] = None
     return {"status": "session_ended"}, 200
 
 @app.route("/update_attendance", methods=["POST"])
 def update_attendance():
     """Update attendance status"""
-    if not data['active_session']:
+    if not data['settings']['active_session']:
         return {"error": "No active attendance session"}, 400
     
     req_data = request.json
@@ -403,7 +325,7 @@ def update_attendance():
 @app.route("/update_attendance_status", methods=["POST"])
 def update_attendance_status():
     """Manually update a student's attendance status"""
-    if not data['active_session']:
+    if not data['settings']['active_session']:
         return {"error": "No active attendance session"}, 400
     
     req_data = request.json
@@ -454,8 +376,8 @@ def get_attendance():
         'students': combined,
         'last_ring': data['last_ring'],
         'ring_students': data['ring_students'],
-        'active_session': data['active_session'],
-        'session_start': data['session_start']
+        'active_session': data['settings']['active_session'],
+        'session_start': data['settings']['session_start']
     })
 
 @app.route("/update_holidays", methods=["POST"])
@@ -789,17 +711,8 @@ def cleanup_clients():
 def start_random_rings():
     """Start periodic random rings"""
     while True:
-        if db['settings']['active_session']:
-            start_time = datetime.fromisoformat(db['settings']['session_start'])
-            if (datetime.now() - start_time) > timedelta(minutes=120):
-                db['settings']['active_session'] = False
-        time.sleep(60)
-
-if __name__ == '__main__':
-    threading.Thread(target=cleanup_sessions, daemon=True).start()
-    app.run(host='0.0.0.0', port=5000, threaded=True)
         time.sleep(random.randint(120, 600))  # 2-10 minutes
-        if data['active_session']:
+        if data['settings']['active_session']:
             present_students = [
                 student for student, info in data['attendance'].items() 
                 if info.get('status') == 'present'
