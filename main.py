@@ -1,5 +1,5 @@
-# --- START OF FILE main.py --
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -9,10 +9,11 @@ import uuid
 import pytz
 
 app = Flask(__name__)
+CORS(app)
 
-# --- In-memory data store ---
+# In-memory database
 data = {
-    'users': {
+    "users": {
         'teacher1': {
             'username': 'teacher',
             'password_hash': generate_password_hash('teacher123'),
@@ -27,19 +28,11 @@ data = {
             'class_id': '10A'
         }
     },
-    'live_attendance': defaultdict(lambda: {
-        'active': False,
-        'current_lecture': None,
-        'accumulated_time': 0,
-        'last_ping': None,
-        'attendance_timer': False,
-        'attendance_start': None,
-        'status': 'Absent',
-        'wifi_connected': False
-    }),
-    'attendance_history': defaultdict(list),
-    'active_sessions': {},
-    'timetable': {
+    "students": {},
+    "authorized_bssids": ["11:22:33:44:55:66"],
+    "active_sessions": {},
+    "attendance_history": defaultdict(list),
+    "timetable": {
         "10A": {
             "Monday": {
                 "09:40-10:40": "Maths",
@@ -97,17 +90,17 @@ data = {
             }
         }
     },
-    'settings': {
-        'authorized_bssids': ["11:22:33:44:55:66"],
-        'session_active': False,
-        'random_rings': []
+    "settings": {
+        "session_active": False,
+        "random_rings": []
     },
-    'messages': []
+    "messages": []
 }
 
 TIMEZONE = 'Asia/Kolkata'
+lock = threading.Lock()
 
-# --- Utility Functions ---
+# Utility Functions
 def get_current_time():
     return datetime.now(pytz.timezone(TIMEZONE))
 
@@ -134,12 +127,15 @@ def get_current_lecture(class_id):
     return None
 
 def calculate_attendance_status(student_id, lecture):
-    live_info = data['live_attendance'][student_id]
+    if student_id not in data["students"]:
+        return 'Absent'
+    
+    student = data["students"][student_id]
     
     if not lecture:
         return 'Absent'
     
-    if live_info.get('attendance_timer', False):
+    if student.get("attendance_timer", False):
         return 'Pending'
     
     time_slot = lecture.split(' (')[0]
@@ -150,11 +146,81 @@ def calculate_attendance_status(student_id, lecture):
                        datetime.combine(datetime.today(), start_time)).total_seconds()
     required_time = lecture_duration * 0.85
     
-    if live_info.get('accumulated_time', 0) >= required_time:
+    if student.get("accumulated_time", 0) >= required_time:
         return 'Present'
     return 'Absent'
 
-# --- User & Session Management ---
+# Background Threads
+def update_timers():
+    while True:
+        with lock:
+            for student_id, student in data["students"].items():
+                if student.get("timer", {}).get("running", False):
+                    elapsed = time.time() - student["timer"]["last_update"]
+                    student["timer"]["remaining"] = max(0, student["timer"]["remaining"] - elapsed)
+                    student["timer"]["last_update"] = time.time()
+                    
+                    if student["timer"]["remaining"] <= 0:
+                        student["timer"]["running"] = False
+                        student["timer"]["status"] = "completed"
+        time.sleep(1)
+
+def attendance_processor():
+    while True:
+        now = get_current_time()
+        today_date_str = now.strftime('%Y-%m-%d')
+        
+        for class_id, timetable in data['timetable'].items():
+            day_schedule = timetable.get(now.strftime('%A'), {})
+            
+            for time_slot, subject in day_schedule.items():
+                try:
+                    start_str, end_str = time_slot.split('-')
+                    start_time = parse_time(start_str.strip())
+                    end_time = parse_time(end_str.strip())
+                    
+                    if now.time() > end_time:
+                        lecture_duration = (datetime.combine(now.date(), end_time) - 
+                                         datetime.combine(now.date(), start_time)).total_seconds()
+                        required_time = lecture_duration * 0.85
+                        
+                        for student_id, user_info in data['users'].items():
+                            if user_info.get('type') == 'student' and user_info.get('class_id') == class_id:
+                                student_data = data['students'].get(student_id, {})
+                                lecture_str = f"{time_slot} ({subject})"
+                                
+                                existing_records = [r for r in data['attendance_history'].get(student_id, []) 
+                                                  if r['date'] == today_date_str and r['lecture'] == lecture_str]
+                                
+                                if not existing_records:
+                                    status = 'Present' if student_data.get('accumulated_time', 0) >= required_time else 'Absent'
+                                    data['attendance_history'][student_id].append({
+                                        'date': today_date_str,
+                                        'lecture': lecture_str,
+                                        'status': status,
+                                        'timestamp': now.isoformat()
+                                    })
+                except ValueError:
+                    continue
+        
+        time.sleep(60)
+
+def session_cleanup():
+    while True:
+        now = get_current_time()
+        for student_id, student in list(data["students"].items()):
+            if student.get("last_ping") and (now - student["last_ping"]).total_seconds() > 30:
+                student["active"] = False
+                student["attendance_timer"] = False
+                student["status"] = 'Absent'
+        time.sleep(15)
+
+# Start background threads
+threading.Thread(target=update_timers, daemon=True).start()
+threading.Thread(target=attendance_processor, daemon=True).start()
+threading.Thread(target=session_cleanup, daemon=True).start()
+
+# User & Session Management
 @app.route('/teacher/register', methods=['POST'])
 def teacher_register():
     req = request.json
@@ -165,14 +231,62 @@ def teacher_register():
     if any(u['username'] == username for u in data['users'].values()):
         return jsonify({'error': 'Username already exists'}), 400
 
-    user_id = str(uuid.uuid4())
-    data['users'][user_id] = {
-        'username': username,
-        'password_hash': generate_password_hash(req['password']),
-        'type': 'teacher',
-        'name': req.get('name', username)
-    }
+    with lock:
+        user_id = str(uuid.uuid4())
+        data['users'][user_id] = {
+            'username': username,
+            'password_hash': generate_password_hash(req['password']),
+            'type': 'teacher',
+            'name': req.get('name', username)
+        }
     return jsonify({'message': 'Teacher registered successfully'}), 201
+
+@app.route('/student/register', methods=['POST'])
+def student_register():
+    req = request.json
+    if not all(key in req for key in ['username', 'password', 'name', 'class_id']):
+        return jsonify({'error': 'Missing required fields'}), 400
+        
+    username = req['username']
+    if any(u['username'] == username for u in data['users'].values()):
+        return jsonify({'error': 'Username already exists'}), 400
+
+    with lock:
+        user_id = str(uuid.uuid4())
+        data['users'][user_id] = {
+            'username': username,
+            'password_hash': generate_password_hash(req['password']),
+            'type': 'student',
+            'name': req['name'],
+            'class_id': req['class_id']
+        }
+        
+        # Initialize student data
+        data["students"][user_id] = {
+            "timer": {
+                "duration": 300,
+                "remaining": 0,
+                "running": False,
+                "last_update": None,
+                "status": "stopped"
+            },
+            "connected": False,
+            "authorized": False,
+            "active": False,
+            "current_lecture": None,
+            "accumulated_time": 0,
+            "last_ping": None,
+            "attendance_timer": False,
+            "status": "Absent",
+            "wifi_connected": False
+        }
+        
+    return jsonify({
+        'message': 'Student registered successfully',
+        'user_id': user_id,
+        'name': req['name'],
+        'class_id': req['class_id']
+    }), 201
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -184,28 +298,29 @@ def login():
     if not all([username, password, device_id]):
         return jsonify({'error': 'Missing credentials or device ID'}), 400
 
-    user_id, user_info = next(((uid, uinfo) for uid, uinfo in data['users'].items() 
-                             if uinfo['username'] == username), (None, None))
-            
-    if not user_id or not check_password_hash(user_info.get('password_hash', ''), password):
-        return jsonify({'error': 'Invalid credentials'}), 401
+    with lock:
+        user_id, user_info = next(((uid, uinfo) for uid, uinfo in data['users'].items() 
+                                 if uinfo['username'] == username), (None, None))
+                
+        if not user_id or not check_password_hash(user_info.get('password_hash', ''), password):
+            return jsonify({'error': 'Invalid credentials'}), 401
 
-    if user_info['type'] == 'student' and user_id in data['active_sessions'].values():
-        active_device = next((dev for dev, uid in data['active_sessions'].items() if uid == user_id), None)
-        if active_device != device_id:
-            return jsonify({'error': 'This account is already logged in on another device.'}), 403
+        if user_info['type'] == 'student' and user_id in data['active_sessions'].values():
+            active_device = next((dev for dev, uid in data['active_sessions'].items() if uid == user_id), None)
+            if active_device != device_id:
+                return jsonify({'error': 'This account is already logged in on another device.'}), 403
 
-    data['active_sessions'][device_id] = user_id
-    
-    response = {
-        'message': 'Login successful', 
-        'user_id': user_id, 
-        'type': user_info['type'], 
-        'name': user_info.get('name', username)
-    }
-    if user_info['type'] == 'student':
-        response['class_id'] = user_info.get('class_id')
+        data['active_sessions'][device_id] = user_id
         
+        response = {
+            'message': 'Login successful', 
+            'user_id': user_id, 
+            'type': user_info['type'], 
+            'name': user_info.get('name', username)
+        }
+        if user_info['type'] == 'student':
+            response['class_id'] = user_info.get('class_id')
+            
     return jsonify(response), 200
 
 @app.route('/logout', methods=['POST'])
@@ -213,47 +328,16 @@ def logout():
     device_id = request.json.get('device_id')
     student_id = request.json.get('student_id')
     
-    if device_id in data['active_sessions']:
-        if student_id in data['live_attendance']:
-            data['live_attendance'][student_id]['active'] = False
-            data['live_attendance'][student_id]['attendance_timer'] = False
-            data['live_attendance'][student_id]['status'] = 'Absent'
-        del data['active_sessions'][device_id]
+    with lock:
+        if device_id in data['active_sessions']:
+            if student_id in data['students']:
+                data['students'][student_id]['active'] = False
+                data['students'][student_id]['attendance_timer'] = False
+                data['students'][student_id]['status'] = 'Absent'
+            del data['active_sessions'][device_id]
     return jsonify({'message': 'Logged out'}), 200
 
-# --- Teacher Endpoints ---
-@app.route('/student/register', methods=['POST'])
-def student_register():
-    req = request.json
-    if not all(key in req for key in ['username', 'password', 'name', 'class_id']):
-        return jsonify({'error': 'Missing required fields'}), 400
-        
-    username = req['username']
-    if any(u['username'] == username for u in data['users'].values()):
-        return jsonify({'error': 'Username already exists'}), 400
-
-    user_id = str(uuid.uuid4())
-    data['users'][user_id] = {
-        'username': username,
-        'password_hash': generate_password_hash(req['password']),
-        'type': 'student',
-        'name': req['name'],
-        'class_id': req['class_id']
-    }
-    return jsonify({
-        'message': 'Student registered successfully',
-        'user_id': user_id,
-        'name': req['name'],
-        'class_id': req['class_id']
-    }), 201
-
-@app.route('/timetable', methods=['GET', 'POST'])
-def manage_timetable():
-    if request.method == 'POST':
-        data['timetable'] = request.json
-        return jsonify({'message': 'Timetable updated'}), 200
-    return jsonify(data['timetable'])
-
+# BSSID Management
 @app.route('/settings/bssid', methods=['GET', 'POST'])
 def manage_bssid():
     if request.method == 'POST':
@@ -262,10 +346,247 @@ def manage_bssid():
         for bssid in bssids:
             if len(bssid.split(':')) == 6:
                 valid_bssids.append(bssid.lower())
-        data['settings']['authorized_bssids'] = valid_bssids
+        
+        with lock:
+            data["authorized_bssids"] = valid_bssids
         return jsonify({'message': 'BSSID list updated'}), 200
-    return jsonify({'bssids': data['settings']['authorized_bssids']})
+    
+    return jsonify({'bssids': data["authorized_bssids"]})
 
+@app.route('/student/connect', methods=['POST'])
+def student_connect():
+    student_id = request.json.get('student_id')
+    bssid = request.json.get('bssid')
+    
+    if not student_id or not bssid:
+        return jsonify({"error": "Student ID and BSSID required"}), 400
+    
+    with lock:
+        # Create student if not exists
+        if student_id not in data["students"]:
+            data["students"][student_id] = {
+                "timer": {
+                    "duration": 300,
+                    "remaining": 0,
+                    "running": False,
+                    "last_update": None,
+                    "status": "stopped"
+                },
+                "connected": False,
+                "authorized": False,
+                "active": False,
+                "current_lecture": None,
+                "accumulated_time": 0,
+                "last_ping": None,
+                "attendance_timer": False,
+                "status": "Absent",
+                "wifi_connected": False
+            }
+        
+        # Check BSSID authorization
+        authorized = (bssid.lower() in data["authorized_bssids"])
+        data["students"][student_id]["connected"] = True
+        data["students"][student_id]["authorized"] = authorized
+        data["students"][student_id]["wifi_connected"] = True
+        
+        return jsonify({
+            "authorized": authorized,
+            "message": "Connected"
+        })
+
+# Timer Management
+@app.route('/student/timer/<action>', methods=['POST'])
+def timer_action(action):
+    student_id = request.json.get('student_id')
+    
+    if not student_id:
+        return jsonify({"error": "Student ID required"}), 400
+    
+    if action not in ["start", "pause", "stop"]:
+        return jsonify({"error": "Invalid action"}), 400
+    
+    with lock:
+        if student_id not in data["students"]:
+            return jsonify({"error": "Student not found"}), 404
+            
+        student = data["students"][student_id]
+        
+        if action == "start":
+            if not student["authorized"]:
+                return jsonify({"error": "Not authorized"}), 403
+            student["timer"] = {
+                "duration": 300,
+                "remaining": 300,
+                "running": True,
+                "last_update": time.time(),
+                "status": "running"
+            }
+        elif action == "pause":
+            if not student["timer"]["running"]:
+                return jsonify({"error": "Timer not running"}), 400
+            student["timer"]["running"] = False
+            student["timer"]["status"] = "paused"
+        elif action == "stop":
+            student["timer"] = {
+                "duration": 300,
+                "remaining": 0,
+                "running": False,
+                "last_update": None,
+                "status": "stopped"
+            }
+    
+    return jsonify({"message": f"Timer {action}ed"})
+
+# Attendance Management
+@app.route('/ping', methods=['POST'])
+def ping():
+    PING_INTERVAL = 10
+    device_id = request.json.get('device_id')
+    student_id = request.json.get('student_id')
+    wifi_status = request.json.get('wifi_status', False)
+    
+    if device_id not in data['active_sessions']:
+        return jsonify({'error': 'Session expired. Please log in again.'}), 401
+    
+    if student_id != data['active_sessions'][device_id]:
+        return jsonify({'error': 'Invalid student ID'}), 401
+    
+    with lock:
+        student_info = data['users'][student_id]
+        lecture = get_current_lecture(student_info.get('class_id'))
+        
+        student_data = data['students'][student_id]
+        student_data['last_ping'] = get_current_time()
+        student_data['wifi_connected'] = wifi_status
+        
+        if lecture:
+            if student_data['current_lecture'] != lecture:
+                student_data['current_lecture'] = lecture
+                student_data['accumulated_time'] = 0
+                
+            student_data['active'] = True
+            student_data['accumulated_time'] += PING_INTERVAL
+            
+            if student_data.get('attendance_timer', False):
+                student_data['status'] = 'Pending'
+            else:
+                student_data['status'] = calculate_attendance_status(student_id, lecture)
+        else:
+            student_data['active'] = False
+            student_data['current_lecture'] = None
+            student_data['attendance_timer'] = False
+            student_data['status'] = 'Absent'
+        
+        return jsonify({
+            'status': 'pong',
+            'current_lecture': student_data['current_lecture'],
+            'accumulated_time': student_data['accumulated_time'],
+            'attendance_status': student_data['status']
+        }), 200
+
+@app.route('/complete_attendance', methods=['POST'])
+def complete_attendance():
+    req = request.json
+    student_id = req.get('student_id')
+    lecture = req.get('lecture')
+    duration = req.get('duration', 0)
+    
+    if student_id not in data['users']:
+        return jsonify({'error': 'Invalid student ID'}), 400
+        
+    with lock:
+        student_data = data['students'][student_id]
+        student_data['accumulated_time'] += duration
+        student_data['attendance_timer'] = False
+        student_data['status'] = 'Present'
+        
+        today = get_current_time().strftime('%Y-%m-%d')
+        data['attendance_history'][student_id].append({
+            'date': today,
+            'lecture': lecture,
+            'status': 'Present',
+            'timestamp': get_current_time().isoformat()
+        })
+        
+        return jsonify({'message': 'Attendance marked'}), 200
+
+@app.route('/mark_present', methods=['POST'])
+def mark_present():
+    student_id = request.json.get('student_id')
+    if student_id not in data['users']:
+        return jsonify({'error': 'Invalid student ID'}), 400
+        
+    with lock:
+        today = get_current_time().strftime('%Y-%m-%d')
+        lecture = get_current_lecture(data['users'][student_id].get('class_id'))
+        
+        if not lecture:
+            return jsonify({'error': 'No active lecture'}), 400
+            
+        data['attendance_history'][student_id].append({
+            'date': today,
+            'lecture': lecture,
+            'status': 'Present',
+            'timestamp': get_current_time().isoformat()
+        })
+        
+        # Update live status
+        data['students'][student_id]['status'] = 'Present'
+        
+        return jsonify({'message': 'Student marked present'}), 200
+
+# Session Management
+@app.route('/session/status', methods=['GET'])
+def get_session_status():
+    return jsonify({
+        'session_active': data['settings']['session_active'],
+        'random_rings': data['settings']['random_rings']
+    })
+
+@app.route('/session/start', methods=['POST'])
+def start_session():
+    with lock:
+        data['settings']['session_active'] = True
+    return jsonify({'message': 'Session started'})
+
+@app.route('/session/end', methods=['POST'])
+def end_session():
+    with lock:
+        data['settings']['session_active'] = False
+    return jsonify({'message': 'Session ended'})
+
+@app.route('/random_ring', methods=['POST'])
+def random_ring():
+    if not data['settings']['session_active']:
+        return jsonify({'error': 'No active session'}), 400
+        
+    with lock:
+        students = [uid for uid, uinfo in data['users'].items() if uinfo['type'] == 'student']
+        if len(students) < 2:
+            return jsonify({'error': 'Not enough students'}), 400
+        
+        attendance_stats = []
+        for student_id in students:
+            history = data['attendance_history'].get(student_id, [])
+            present_count = sum(1 for r in history if r['status'] == 'Present')
+            total_count = len(history)
+            attendance_percent = (present_count / total_count * 100) if total_count > 0 else 0
+            attendance_stats.append((student_id, attendance_percent))
+        
+        attendance_stats.sort(key=lambda x: x[1])
+        
+        selected = [
+            attendance_stats[0][0],
+            attendance_stats[-1][0]
+        ]
+        
+        data['settings']['random_rings'] = selected
+        return jsonify({
+            'message': 'Random ring sent',
+            'students': selected
+        })
+
+# Student Data Management
 @app.route('/students', methods=['GET'])
 def get_all_students():
     students = [{
@@ -312,211 +633,6 @@ def get_student_profile(student_id):
         'detailed_report': history
     })
 
-# --- Session Management ---
-@app.route('/session/status', methods=['GET'])
-def get_session_status():
-    return jsonify({
-        'session_active': data['settings']['session_active'],
-        'random_rings': data['settings']['random_rings']
-    })
-
-@app.route('/session/start', methods=['POST'])
-def start_session():
-    data['settings']['session_active'] = True
-    return jsonify({'message': 'Session started'})
-
-@app.route('/session/end', methods=['POST'])
-def end_session():
-    data['settings']['session_active'] = False
-    return jsonify({'message': 'Session ended'})
-
-@app.route('/random_ring', methods=['POST'])
-def random_ring():
-    if not data['settings']['session_active']:
-        return jsonify({'error': 'No active session'}), 400
-        
-    students = [uid for uid, uinfo in data['users'].items() if uinfo['type'] == 'student']
-    if len(students) < 2:
-        return jsonify({'error': 'Not enough students'}), 400
-    
-    attendance_stats = []
-    for student_id in students:
-        history = data['attendance_history'].get(student_id, [])
-        present_count = sum(1 for r in history if r['status'] == 'Present')
-        total_count = len(history)
-        attendance_percent = (present_count / total_count * 100) if total_count > 0 else 0
-        attendance_stats.append((student_id, attendance_percent))
-    
-    attendance_stats.sort(key=lambda x: x[1])
-    
-    selected = [
-        attendance_stats[0][0],
-        attendance_stats[-1][0]
-    ]
-    
-    data['settings']['random_rings'] = selected
-    return jsonify({
-        'message': 'Random ring sent',
-        'students': selected
-    })
-
-# --- Attendance Management ---
-@app.route('/update_status', methods=['POST'])
-def update_status():
-    req = request.json
-    student_id = req.get('student_id')
-    status = req.get('status')
-    
-    if student_id not in data['users'] or data['users'][student_id]['type'] != 'student':
-        return jsonify({'error': 'Invalid student ID'}), 400
-    
-    valid_statuses = ['Absent', 'Pending', 'Present']
-    if status not in valid_statuses:
-        return jsonify({'error': 'Invalid status'}), 400
-    
-    data['live_attendance'][student_id]['status'] = status
-    
-    if status == 'Present':
-        lecture = data['live_attendance'][student_id].get('current_lecture')
-        if lecture:
-            today = get_current_time().strftime('%Y-%m-%d')
-            data['attendance_history'][student_id].append({
-                'date': today,
-                'lecture': lecture,
-                'status': 'Present',
-                'timestamp': get_current_time().isoformat()
-            })
-    
-    return jsonify({'message': 'Status updated'}), 200
-
-@app.route('/ping', methods=['POST'])
-def ping():
-    PING_INTERVAL = 10
-    device_id = request.json.get('device_id')
-    student_id = request.json.get('student_id')
-    wifi_status = request.json.get('wifi_status', False)
-    
-    if device_id not in data['active_sessions']:
-        return jsonify({'error': 'Session expired. Please log in again.'}), 401
-    
-    if student_id != data['active_sessions'][device_id]:
-        return jsonify({'error': 'Invalid student ID'}), 401
-    
-    student_info = data['users'][student_id]
-    lecture = get_current_lecture(student_info.get('class_id'))
-    
-    live_data = data['live_attendance'][student_id]
-    live_data['last_ping'] = get_current_time()
-    live_data['wifi_connected'] = wifi_status
-    
-    if lecture:
-        if live_data['current_lecture'] != lecture:
-            live_data['current_lecture'] = lecture
-            live_data['accumulated_time'] = 0
-            
-        live_data['active'] = True
-        live_data['accumulated_time'] += PING_INTERVAL
-        
-        if live_data.get('attendance_timer', False):
-            live_data['status'] = 'Pending'
-        else:
-            live_data['status'] = calculate_attendance_status(student_id, lecture)
-    else:
-        live_data['active'] = False
-        live_data['current_lecture'] = None
-        live_data['attendance_timer'] = False
-        live_data['status'] = 'Absent'
-    
-    return jsonify({
-        'status': 'pong',
-        'current_lecture': live_data['current_lecture'],
-        'accumulated_time': live_data['accumulated_time'],
-        'attendance_status': live_data['status']
-    }), 200
-
-@app.route('/complete_attendance', methods=['POST'])
-def complete_attendance():
-    req = request.json
-    student_id = req.get('student_id')
-    lecture = req.get('lecture')
-    duration = req.get('duration', 0)
-    
-    if student_id not in data['users']:
-        return jsonify({'error': 'Invalid student ID'}), 400
-        
-    live_data = data['live_attendance'][student_id]
-    live_data['accumulated_time'] += duration
-    live_data['attendance_timer'] = False
-    live_data['status'] = 'Present'
-    
-    today = get_current_time().strftime('%Y-%m-%d')
-    data['attendance_history'][student_id].append({
-        'date': today,
-        'lecture': lecture,
-        'status': 'Present',
-        'timestamp': get_current_time().isoformat()
-    })
-    
-    return jsonify({'message': 'Attendance marked'}), 200
-
-@app.route('/mark_present', methods=['POST'])
-def mark_present():
-    student_id = request.json.get('student_id')
-    if student_id not in data['users']:
-        return jsonify({'error': 'Invalid student ID'}), 400
-        
-    today = get_current_time().strftime('%Y-%m-%d')
-    lecture = get_current_lecture(data['users'][student_id].get('class_id'))
-    
-    if not lecture:
-        return jsonify({'error': 'No active lecture'}), 400
-        
-    data['attendance_history'][student_id].append({
-        'date': today,
-        'lecture': lecture,
-        'status': 'Present',
-        'timestamp': get_current_time().isoformat()
-    })
-    
-    # Update live status
-    data['live_attendance'][student_id]['status'] = 'Present'
-    
-    return jsonify({'message': 'Student marked present'}), 200
-
-@app.route('/live_data', methods=['GET'])
-def get_live_data():
-    response = {'students': [], 'random_rings': data['settings']['random_rings']}
-    
-    for user_id, user_info in data['users'].items():
-        if user_info['type'] == 'student':
-            live_info = data['live_attendance'][user_id]
-            
-            status = live_info.get('status', 'Absent')
-            
-            last_update = live_info.get('last_ping')
-            if last_update:
-                last_update_str = last_update.strftime('%Y-%m-%d %H:%M:%S')
-            else:
-                last_update_str = "Never"
-                
-            response['students'].append({
-                'id': user_id,
-                'name': user_info['name'],
-                'class_id': user_info.get('class_id'),
-                'status': status,
-                'current_lecture': live_info['current_lecture'],
-                'accumulated_time': live_info.get('accumulated_time', 0),
-                'last_update': last_update_str,
-                'wifi_connected': live_info.get('wifi_connected', False),
-                'attendance_timer': live_info.get('attendance_timer', False)
-            })
-    
-    return jsonify(response)
-
-@app.route('/student/attendance_history/<student_id>', methods=['GET'])
-def get_student_history(student_id):
-    return jsonify(data['attendance_history'].get(student_id, []))
-
 @app.route('/student/academic_info/<student_id>', methods=['GET'])
 def get_academic_info(student_id):
     if student_id not in data['users']:
@@ -536,10 +652,20 @@ def get_academic_info(student_id):
     return jsonify({
         'class_id': data['users'][student_id].get('class_id'),
         'attendance_percentage': (present_count / total_count * 100) if total_count > 0 else 0,
-        'current_lecture': data['live_attendance'][student_id].get('current_lecture'),
+        'current_lecture': data['students'][student_id].get('current_lecture'),
         'today_status': today_status
     })
 
+# Timetable Management
+@app.route('/timetable', methods=['GET', 'POST'])
+def manage_timetable():
+    if request.method == 'POST':
+        with lock:
+            data['timetable'] = request.json
+        return jsonify({'message': 'Timetable updated'}), 200
+    return jsonify(data['timetable'])
+
+# Reporting
 @app.route('/report', methods=['GET'])
 def generate_report():
     from_date = request.args.get('from_date')
@@ -573,7 +699,7 @@ def generate_report():
     
     return jsonify(dict(sorted(report.items())))
 
-# --- Messaging System ---
+# Messaging System
 @app.route('/send_message', methods=['POST'])
 def send_message():
     req = request.json
@@ -584,19 +710,20 @@ def send_message():
     if not all([from_id, to_username, content]):
         return jsonify({'error': 'Missing required fields'}), 400
         
-    recipient_id, recipient_info = next(((uid, uinfo) for uid, uinfo in data['users'].items() 
-                                      if uinfo['username'] == to_username), (None, None))
-    if not recipient_id:
-        return jsonify({'error': 'Recipient not found'}), 404
+    with lock:
+        recipient_id, recipient_info = next(((uid, uinfo) for uid, uinfo in data['users'].items() 
+                                          if uinfo['username'] == to_username), (None, None))
+        if not recipient_id:
+            return jsonify({'error': 'Recipient not found'}), 404
+            
+        data['messages'].append({
+            'from_id': from_id,
+            'from_name': data['users'][from_id]['name'],
+            'to_id': recipient_id,
+            'content': content,
+            'timestamp': get_current_time().isoformat()
+        })
         
-    data['messages'].append({
-        'from_id': from_id,
-        'from_name': data['users'][from_id]['name'],
-        'to_id': recipient_id,
-        'content': content,
-        'timestamp': get_current_time().isoformat()
-    })
-    
     return jsonify({'message': 'Message sent'}), 200
 
 @app.route('/messages/<user_id>', methods=['GET'])
@@ -608,59 +735,73 @@ def get_messages(user_id):
     
     return jsonify({'messages': messages})
 
-# --- Background Processing ---
-def attendance_processor():
-    while True:
-        now = get_current_time()
-        today_date_str = now.strftime('%Y-%m-%d')
+# Status Endpoints
+@app.route('/get_status', methods=['GET'])
+def get_status():
+    with lock:
+        response = {
+            'authorized_bssids': data['authorized_bssids'],
+            'students': {},
+            'session_status': {
+                'session_active': data['settings']['session_active'],
+                'random_rings': data['settings']['random_rings']
+            }
+        }
         
-        for class_id, timetable in data['timetable'].items():
-            day_schedule = timetable.get(now.strftime('%A'), {})
-            
-            for time_slot, subject in day_schedule.items():
-                try:
-                    start_str, end_str = time_slot.split('-')
-                    start_time = parse_time(start_str.strip())
-                    end_time = parse_time(end_str.strip())
+        for user_id, user_info in data['users'].items():
+            if user_info['type'] == 'student':
+                student_data = data['students'].get(user_id, {})
+                last_update = student_data.get('last_ping')
+                
+                response['students'][user_id] = {
+                    'name': user_info['name'],
+                    'class_id': user_info.get('class_id'),
+                    'status': student_data.get('status', 'Absent'),
+                    'current_lecture': student_data.get('current_lecture'),
+                    'accumulated_time': student_data.get('accumulated_time', 0),
+                    'last_update': last_update.isoformat() if last_update else "Never",
+                    'wifi_connected': student_data.get('wifi_connected', False),
+                    'attendance_timer': student_data.get('attendance_timer', False),
+                    'timer': student_data.get('timer', {})
+                }
+        
+        return jsonify(response)
+
+@app.route('/student/attendance_history/<student_id>', methods=['GET'])
+def get_student_history(student_id):
+    return jsonify(data['attendance_history'].get(student_id, []))
+
+@app.route('/live_data', methods=['GET'])
+def get_live_data():
+    response = {'students': [], 'random_rings': data['settings']['random_rings']}
+    
+    with lock:
+        for user_id, user_info in data['users'].items():
+            if user_info['type'] == 'student':
+                student_data = data['students'].get(user_id, {})
+                
+                status = student_data.get('status', 'Absent')
+                
+                last_update = student_data.get('last_ping')
+                if last_update:
+                    last_update_str = last_update.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    last_update_str = "Never"
                     
-                    if now.time() > end_time:
-                        lecture_duration = (datetime.combine(now.date(), end_time) - 
-                                         datetime.combine(now.date(), start_time)).total_seconds()
-                        required_time = lecture_duration * 0.85
-                        
-                        for student_id, user_info in data['users'].items():
-                            if user_info.get('class_id') == class_id:
-                                live_info = data['live_attendance'][student_id]
-                                lecture_str = f"{time_slot} ({subject})"
-                                
-                                existing_records = [r for r in data['attendance_history'].get(student_id, []) 
-                                                  if r['date'] == today_date_str and r['lecture'] == lecture_str]
-                                
-                                if not existing_records:
-                                    status = 'Present' if live_info.get('accumulated_time', 0) >= required_time else 'Absent'
-                                    data['attendance_history'][student_id].append({
-                                        'date': today_date_str,
-                                        'lecture': lecture_str,
-                                        'status': status,
-                                        'timestamp': now.isoformat()
-                                    })
-                except ValueError:
-                    continue
-        
-        time.sleep(60)
+                response['students'].append({
+                    'id': user_id,
+                    'name': user_info['name'],
+                    'class_id': user_info.get('class_id'),
+                    'status': status,
+                    'current_lecture': student_data.get('current_lecture'),
+                    'accumulated_time': student_data.get('accumulated_time', 0),
+                    'last_update': last_update_str,
+                    'wifi_connected': student_data.get('wifi_connected', False),
+                    'attendance_timer': student_data.get('attendance_timer', False),
+                    'timer': student_data.get('timer', {})
+                })
+    
+    return jsonify(response)
 
-def session_cleanup():
-    while True:
-        now = get_current_time()
-        for student_id, live_info in list(data['live_attendance'].items()):
-            if live_info.get('last_ping') and (now - live_info['last_ping']).total_seconds() > 30:
-                live_info['active'] = False
-                live_info['attendance_timer'] = False
-                live_info['status'] = 'Absent'
-        time.sleep(15)
-
-if __name__ == "__main__":
-    threading.Thread(target=attendance_processor, daemon=True).start()
-    threading.Thread(target=session_cleanup, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000, debug=True)
-# --- END OF FILE main.py ---
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
