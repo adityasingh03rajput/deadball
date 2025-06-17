@@ -1,123 +1,111 @@
-# --- START OF FILE main.py ---
-
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import threading
 import time
 import uuid
-import pytz
+import random
+import os
+import face_recognition
+import cv2
+import numpy as np
+from io import BytesIO
+import json
 
 app = Flask(__name__)
 
-# --- In-memory data store (simulating a database) ---
-data = {
-    'users': {
-        # Sample teacher
-        'teacher1': {
-            'username': 'teacher',
-            'password_hash': generate_password_hash('teacher123'),
-            'type': 'teacher',
-            'name': 'Admin Teacher'
+# Database simulation
+class Database:
+    def __init__(self):
+        self.users = {}
+        self.live_attendance = defaultdict(lambda: {
+            'active': False,
+            'current_lecture': None,
+            'accumulated_time': 0,
+            'last_ping': None
+        })
+        self.attendance_history = defaultdict(list)
+        self.active_sessions = {}
+        self.timetable = {}
+        self.settings = {
+            'authorized_bssids': ['ee:ee:6d:9d:6f:ba'],
+            'class_locations': {
+                'default': {'lat': 28.7041, 'lon': 77.1025, 'radius': 100}
+            }
         }
-    },
-    'live_attendance': defaultdict(lambda: {
-        'active': False, 
-        'current_lecture': None, 
-        'accumulated_time': 0, 
-        'last_ping': None,
-        'attendance_timer': False,
-        'attendance_start': None
-    }),
-    'attendance_history': defaultdict(list),
-    'active_sessions': {},
-    'timetable': {
-        "10A": {
-            "Monday": {
-                "09:40-10:40": "Maths",
-                "10:40-11:40": "Physics",
-                "11:40-12:40": "Chemistry",
-                "12:40-13:40": "Lunch",
-                "13:40-14:40": "English",
-                "14:40-15:40": "Computer Science",
-                "15:40-16:40": "Physical Education"
-            },
-            # Other days similarly...
-        }
-    },
-    'settings': {
-        'authorized_bssids': [],
-        'session_active': False,
-        'random_rings': []
-    }
-}
+        self.random_ring_selections = {}
+        self.face_encodings = {}
+        self.penalties = {}
 
-TIMEZONE = 'Asia/Kolkata'
+db = Database()
 
-# --- Utility Functions ---
-def get_current_time():
-    return datetime.now(pytz.timezone(TIMEZONE))
+# Helper functions
+def get_utc_now():
+    return datetime.now(timezone.utc)
 
-def parse_time(time_str):
-    return datetime.strptime(time_str, "%H:%M").time()
+def validate_location(student_lat, student_lon, class_id='default'):
+    class_loc = db.settings['class_locations'].get(class_id)
+    if not class_loc:
+        return False
+    distance = ((student_lat - class_loc['lat'])**2 + 
+               (student_lon - class_loc['lon'])**2)**0.5 * 111000
+    return distance <= class_loc['radius']
 
 def get_current_lecture(class_id):
-    if not class_id: return None
-    
-    now = get_current_time()
-    day_of_week = now.strftime('%A') 
+    now = get_utc_now()
+    day_of_week = now.strftime('%A')
     current_time = now.time()
-
-    class_timetable = data['timetable'].get(class_id, {}).get(day_of_week, {})
+    
+    class_timetable = db.timetable.get(class_id, {}).get(day_of_week, {})
     for time_slot, subject in class_timetable.items():
         try:
             start_str, end_str = time_slot.split('-')
-            start_time = parse_time(start_str.strip())
-            end_time = parse_time(end_str.strip())
+            start_time = datetime.strptime(start_str.strip(), "%H:%M").time()
+            end_time = datetime.strptime(end_str.strip(), "%H:%M").time()
             if start_time <= current_time <= end_time:
                 return f"{time_slot} ({subject})"
         except ValueError:
             continue
     return None
 
-def calculate_attendance_status(student_id, lecture):
-    live_info = data['live_attendance'][student_id]
-    if not lecture or not live_info['attendance_timer']:
-        return 'Absent'
-    
-    # Calculate required time (85% of lecture duration)
-    time_slot = lecture.split(' (')[0]
-    start_str, end_str = time_slot.split('-')
-    start_time = parse_time(start_str.strip())
-    end_time = parse_time(end_str.strip())
-    lecture_duration = (datetime.combine(datetime.today(), end_time) - 
-                       datetime.combine(datetime.today(), start_time)).total_seconds()
-    required_time = lecture_duration * 0.85
-    
-    if live_info['accumulated_time'] >= required_time:
-        return 'Present'
-    return 'Absent'
-
-# --- User & Session Management ---
+# User Management Endpoints
 @app.route('/teacher/register', methods=['POST'])
 def teacher_register():
     req = request.json
     if not req or not req.get('username') or not req.get('password'):
         return jsonify({'error': 'Username and password required'}), 400
     
-    username = req['username']
-    if any(u['username'] == username for u in data['users'].values()):
-        return jsonify({'error': 'Username already exists'}), 400
+    if any(u['username'] == req['username'] for u in db.users.values()):
+        return jsonify({'error': 'Username exists'}), 400
 
     user_id = str(uuid.uuid4())
-    data['users'][user_id] = {
-        'username': username,
+    db.users[user_id] = {
+        'username': req['username'],
         'password_hash': generate_password_hash(req['password']),
         'type': 'teacher',
-        'name': req.get('name', username)
+        'name': req.get('name', req['username'])
     }
-    return jsonify({'message': 'Teacher registered successfully'}), 201
+    return jsonify({'message': 'Teacher registered'}), 201
+
+@app.route('/student/register', methods=['POST'])
+def student_register():
+    req = request.json
+    if not req or not req.get('username') or not req.get('password'):
+        return jsonify({'error': 'Username and password required'}), 400
+    
+    if any(u['username'] == req['username'] for u in db.users.values()):
+        return jsonify({'error': 'Username exists'}), 400
+
+    user_id = str(uuid.uuid4())
+    db.users[user_id] = {
+        'username': req['username'],
+        'password_hash': generate_password_hash(req['password']),
+        'type': 'student',
+        'name': req.get('name', req['username']),
+        'class_id': req.get('class_id')
+    }
+    return jsonify({'message': 'Student registered', 'user_id': user_id}), 201
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -127,468 +115,215 @@ def login():
     device_id = req.get('device_id')
     
     if not all([username, password, device_id]):
-        return jsonify({'error': 'Missing credentials or device ID'}), 400
+        return jsonify({'error': 'Missing credentials'}), 400
 
-    user_id, user_info = next(((uid, uinfo) for uid, uinfo in data['users'].items() 
-                             if uinfo['username'] == username), (None, None))
-            
-    if not user_id or not check_password_hash(user_info.get('password_hash', ''), password):
+    user = next((u for u in db.users.values() if u['username'] == username), None)
+    if not user or not check_password_hash(user['password_hash'], password):
         return jsonify({'error': 'Invalid credentials'}), 401
 
-    if user_info['type'] == 'student' and user_id in data['active_sessions'].values():
-        active_device = next((dev for dev, uid in data['active_sessions'].items() if uid == user_id), None)
+    user_id = next(uid for uid, u in db.users.items() if u['username'] == username)
+    
+    # One device per user enforcement
+    if user_id in db.active_sessions.values():
+        active_device = next(d for d, uid in db.active_sessions.items() if uid == user_id)
         if active_device != device_id:
-            return jsonify({'error': 'This account is already logged in on another device.'}), 403
+            return jsonify({'error': 'Account in use on another device'}), 403
 
-    data['active_sessions'][device_id] = user_id
+    db.active_sessions[device_id] = user_id
     
     response = {
-        'message': 'Login successful', 
-        'user_id': user_id, 
-        'type': user_info['type'], 
-        'name': user_info.get('name', username)
+        'message': 'Login successful',
+        'user_id': user_id,
+        'type': user['type'],
+        'name': user.get('name')
     }
-    if user_info['type'] == 'student':
-        response['class_id'] = user_info.get('class_id')
+    if user['type'] == 'student':
+        response['class_id'] = user.get('class_id')
         
     return jsonify(response), 200
 
-@app.route('/logout', methods=['POST'])
-def logout():
-    device_id = request.json.get('device_id')
-    student_id = request.json.get('student_id')
-    
-    if device_id in data['active_sessions']:
-        if student_id in data['live_attendance']:
-            data['live_attendance'][student_id]['active'] = False
-            data['live_attendance'][student_id]['attendance_timer'] = False
-        del data['active_sessions'][device_id]
-    return jsonify({'message': 'Logged out'}), 200
-
-# --- Teacher Endpoints ---
-@app.route('/student/register', methods=['POST'])
-def student_register():
-    req = request.json
-    if not all(key in req for key in ['username', 'password', 'name', 'class_id']):
-        return jsonify({'error': 'Missing required fields'}), 400
-        
-    username = req['username']
-    if any(u['username'] == username for u in data['users'].values()):
-        return jsonify({'error': 'Username already exists'}), 400
-
-    user_id = str(uuid.uuid4())
-    data['users'][user_id] = {
-        'username': username,
-        'password_hash': generate_password_hash(req['password']),
-        'type': 'student',
-        'name': req['name'],
-        'class_id': req['class_id']
-    }
-    return jsonify({
-        'message': 'Student registered successfully',
-        'user_id': user_id,
-        'name': req['name'],
-        'class_id': req['class_id']
-    }), 201
-
-@app.route('/timetable', methods=['GET', 'POST'])
-def manage_timetable():
-    if request.method == 'POST':
-        data['timetable'] = request.json
-        return jsonify({'message': 'Timetable updated'}), 200
-    return jsonify(data['timetable'])
-
-@app.route('/settings/bssid', methods=['GET', 'POST'])
-def manage_bssid():
-    if request.method == 'POST':
-        bssids = request.json.get('bssids', [])
-        # Validate BSSID format
-        valid_bssids = []
-        for bssid in bssids:
-            if len(bssid.split(':')) == 6:  # Basic validation
-                valid_bssids.append(bssid.lower())
-        data['settings']['authorized_bssids'] = valid_bssids
-        return jsonify({'message': 'BSSID list updated'}), 200
-    return jsonify({'bssids': data['settings']['authorized_bssids']})
-
-@app.route('/students', methods=['GET'])
-def get_all_students():
-    students = [{
-        'id': uid,
-        'name': uinfo['name'],
-        'username': uinfo['username'],
-        'class_id': uinfo.get('class_id')
-    } for uid, uinfo in data['users'].items() if uinfo['type'] == 'student']
-    return jsonify(students)
-
-@app.route('/classmates/<class_id>', methods=['GET'])
-def get_classmates(class_id):
-    classmates = [{
-        'id': uid,
-        'name': uinfo['name'],
-        'username': uinfo['username']
-    } for uid, uinfo in data['users'].items() 
-     if uinfo['type'] == 'student' and uinfo.get('class_id') == class_id]
-    return jsonify({'students': classmates})
-
-@app.route('/student/profile/<student_id>', methods=['GET'])
-def get_student_profile(student_id):
-    if student_id not in data['users'] or data['users'][student_id]['type'] != 'student':
-        return jsonify({'error': 'Student not found'}), 404
-        
-    # Calculate attendance stats
-    history = data['attendance_history'].get(student_id, [])
-    present_count = sum(1 for r in history if r['status'] == 'Present')
-    total_count = len(history)
-    
-    # Group by lecture to find most missed
-    lecture_stats = defaultdict(int)
-    for record in history:
-        if record['status'] == 'Absent':
-            lecture_stats[record['lecture']] += 1
-    
-    most_missed = sorted(lecture_stats.items(), key=lambda x: x[1], reverse=True)[:5]
-    
-    return jsonify({
-        'name': data['users'][student_id]['name'],
-        'class_id': data['users'][student_id].get('class_id'),
-        'present_lectures': present_count,
-        'total_lectures': total_count,
-        'attendance_percent': (present_count / total_count * 100) if total_count > 0 else 0,
-        'most_missed': most_missed,
-        'detailed_report': history
-    })
-
-# --- Session Management ---
-@app.route('/session/status', methods=['GET'])
-def get_session_status():
-    return jsonify({
-        'session_active': data['settings']['session_active'],
-        'random_rings': data['settings']['random_rings']
-    })
-
-@app.route('/session/start', methods=['POST'])
-def start_session():
-    data['settings']['session_active'] = True
-    return jsonify({'message': 'Session started'})
-
-@app.route('/session/end', methods=['POST'])
-def end_session():
-    data['settings']['session_active'] = False
-    return jsonify({'message': 'Session ended'})
-
-@app.route('/random_ring', methods=['POST'])
-def random_ring():
-    if not data['settings']['session_active']:
-        return jsonify({'error': 'No active session'}), 400
-        
-    students = [uid for uid, uinfo in data['users'].items() if uinfo['type'] == 'student']
-    if len(students) < 2:
-        return jsonify({'error': 'Not enough students'}), 400
-    
-    # Get attendance stats for all students
-    attendance_stats = []
-    for student_id in students:
-        history = data['attendance_history'].get(student_id, [])
-        present_count = sum(1 for r in history if r['status'] == 'Present')
-        total_count = len(history)
-        attendance_percent = (present_count / total_count * 100) if total_count > 0 else 0
-        attendance_stats.append((student_id, attendance_percent))
-    
-    # Sort by attendance percentage
-    attendance_stats.sort(key=lambda x: x[1])
-    
-    # Select one from top (high attendance) and one from bottom (low attendance)
-    selected = [
-        attendance_stats[0][0],  # Lowest attendance
-        attendance_stats[-1][0]  # Highest attendance
-    ]
-    
-    data['settings']['random_rings'] = selected
-    return jsonify({
-        'message': 'Random ring sent',
-        'students': selected
-    })
-
-# --- Attendance Management ---
+# Attendance Endpoints
 @app.route('/ping', methods=['POST'])
 def ping():
-    PING_INTERVAL = 10
-    device_id = request.json.get('device_id')
-    student_id = request.json.get('student_id')
-    status = request.json.get('status', 'absent')
+    req = request.json
+    device_id = req.get('device_id')
+    student_lat = req.get('latitude')
+    student_lon = req.get('longitude')
     
-    if device_id not in data['active_sessions']:
-        return jsonify({'error': 'Session expired. Please log in again.'}), 401
+    if device_id not in db.active_sessions:
+        return jsonify({'error': 'Session expired'}), 401
     
-    if student_id != data['active_sessions'][device_id]:
-        return jsonify({'error': 'Invalid student ID'}), 401
+    student_id = db.active_sessions[device_id]
+    student_info = db.users[student_id]
     
-    student_info = data['users'][student_id]
+    # Geo-fencing check
+    if student_lat and student_lon:
+        if not validate_location(student_lat, student_lon, student_info.get('class_id')):
+            return jsonify({'error': 'Not in authorized location'}), 403
+    
     lecture = get_current_lecture(student_info.get('class_id'))
-    
-    live_data = data['live_attendance'][student_id]
-    live_data['last_ping'] = get_current_time()
+    live_data = db.live_attendance[student_id]
+    live_data['last_ping'] = get_utc_now()
     
     if lecture:
         if live_data['current_lecture'] != lecture:
             live_data['current_lecture'] = lecture
             live_data['accumulated_time'] = 0
-            
-        live_data['active'] = True
-        live_data['accumulated_time'] += PING_INTERVAL
         
-        # Update status based on attendance timer
-        if status == 'present' and not live_data['attendance_timer']:
-            live_data['attendance_timer'] = True
-            live_data['attendance_start'] = get_current_time()
+        live_data['active'] = True
+        live_data['accumulated_time'] += 10  # Ping interval
     else:
         live_data['active'] = False
         live_data['current_lecture'] = None
-        live_data['attendance_timer'] = False
-    
+
     return jsonify({
         'status': 'pong',
         'current_lecture': live_data['current_lecture'],
         'accumulated_time': live_data['accumulated_time']
     }), 200
 
-@app.route('/complete_attendance', methods=['POST'])
-def complete_attendance():
-    req = request.json
-    student_id = req.get('student_id')
-    lecture = req.get('lecture')
-    duration = req.get('duration', 0)
-    
-    if student_id not in data['users']:
-        return jsonify({'error': 'Invalid student ID'}), 400
-        
-    live_data = data['live_attendance'][student_id]
-    live_data['accumulated_time'] += duration
-    
-    # Mark attendance for current date
-    today = get_current_time().strftime('%Y-%m-%d')
-    data['attendance_history'][student_id].append({
-        'date': today,
-        'lecture': lecture,
-        'status': 'Present',
-        'timestamp': get_current_time().isoformat()
-    })
-    
-    return jsonify({'message': 'Attendance marked'}), 200
+# Random Ring Endpoints
+@app.route('/random_ring', methods=['POST'])
+def random_ring():
+    teacher_id = request.json.get('teacher_id')
+    if not teacher_id or teacher_id not in db.users or db.users[teacher_id]['type'] != 'teacher':
+        return jsonify({'error': 'Invalid teacher'}), 400
 
-@app.route('/mark_present', methods=['POST'])
-def mark_present():
-    student_id = request.json.get('student_id')
-    if student_id not in data['users']:
-        return jsonify({'error': 'Invalid student ID'}), 400
-        
-    today = get_current_time().strftime('%Y-%m-%d')
-    lecture = get_current_lecture(data['users'][student_id].get('class_id'))
+    active_students = [
+        uid for uid, info in db.live_attendance.items() 
+        if info['active'] and db.users[uid]['type'] == 'student'
+    ]
+    selected = random.sample(active_students, min(2, len(active_students)))
     
-    if not lecture:
-        return jsonify({'error': 'No active lecture'}), 400
-        
-    data['attendance_history'][student_id].append({
-        'date': today,
-        'lecture': lecture,
-        'status': 'Present',
-        'timestamp': get_current_time().isoformat()
+    db.random_ring_selections = {
+        'students': selected,
+        'time': get_utc_now().isoformat(),
+        'responded': []
+    }
+    return jsonify({
+        'selected': [db.users[uid]['name'] for uid in selected],
+        'timeout': 300  # 5 minutes to respond
     })
-    
-    return jsonify({'message': 'Student marked present'}), 200
 
+@app.route('/verify_face', methods=['POST'])
+def verify_face():
+    student_id = request.form.get('student_id')
+    if 'image' not in request.files or not student_id:
+        return jsonify({'error': 'Image and ID required'}), 400
+    
+    img_bytes = request.files['image'].read()
+    img_array = np.frombuffer(img_bytes, np.uint8)
+    image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    
+    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    encodings = face_recognition.face_encodings(rgb_image)
+    
+    if not encodings:
+        return jsonify({'error': 'No face detected'}), 400
+    
+    if student_id not in db.face_encodings:
+        db.face_encodings[student_id] = encodings[0].tolist()
+        return jsonify({'verified': True, 'message': 'Face registered'})
+    
+    matches = face_recognition.compare_faces(
+        [np.array(db.face_encodings[student_id])], 
+        encodings[0]
+    )
+    return jsonify({'verified': matches[0]})
+
+# Teacher Dashboard Endpoints
 @app.route('/live_data', methods=['GET'])
 def get_live_data():
-    response = {'students': [], 'random_rings': data['settings']['random_rings']}
-    
-    for user_id, user_info in data['users'].items():
+    response = []
+    for user_id, user_info in db.users.items():
         if user_info['type'] == 'student':
-            live_info = data['live_attendance'][user_id]
-            
-            status = 'Present' if live_info['attendance_timer'] else 'Absent'
-            if live_info['current_lecture']:
-                status = calculate_attendance_status(user_id, live_info['current_lecture'])
-            
-            last_update = live_info.get('last_ping')
-            if last_update:
-                last_update_str = last_update.strftime('%Y-%m-%d %H:%M:%S')
-            else:
-                last_update_str = "Never"
-                
-            response['students'].append({
+            live_info = db.live_attendance[user_id]
+            response.append({
                 'id': user_id,
                 'name': user_info['name'],
                 'class_id': user_info.get('class_id'),
-                'status': status,
+                'status': 'Active' if live_info['active'] else 'Inactive',
                 'current_lecture': live_info['current_lecture'],
-                'accumulated_time': live_info.get('accumulated_time', 0),
-                'last_update': last_update_str,
-                'attendance_timer': live_info.get('attendance_timer', False)
+                'accumulated_time': live_info.get('accumulated_time', 0)
             })
-    
     return jsonify(response)
 
-@app.route('/student/attendance_history/<student_id>', methods=['GET'])
-def get_student_history(student_id):
-    return jsonify(data['attendance_history'].get(student_id, []))
-
-@app.route('/student/academic_info/<student_id>', methods=['GET'])
-def get_academic_info(student_id):
-    if student_id not in data['users']:
-        return jsonify({'error': 'Student not found'}), 404
-        
-    history = data['attendance_history'].get(student_id, [])
-    present_count = sum(1 for r in history if r['status'] == 'Present')
-    total_count = len(history)
-    
-    # Get today's status
-    today = get_current_time().strftime('%Y-%m-%d')
-    today_status = "Unknown"
-    today_records = [r for r in history if r['date'] == today]
-    if today_records:
-        present_today = sum(1 for r in today_records if r['status'] == 'Present')
-        today_status = f"Present for {present_today}/{len(today_records)} lectures"
-    
-    return jsonify({
-        'class_id': data['users'][student_id].get('class_id'),
-        'attendance_percentage': (present_count / total_count * 100) if total_count > 0 else 0,
-        'current_lecture': data['live_attendance'][student_id].get('current_lecture'),
-        'today_status': today_status
-    })
-
-@app.route('/report', methods=['GET'])
-def generate_report():
-    from_date = request.args.get('from_date')
-    to_date = request.args.get('to_date')
-    
-    try:
-        from_date = datetime.strptime(from_date, '%Y-%m-%d').date()
-        to_date = datetime.strptime(to_date, '%Y-%m-%d').date()
-    except ValueError:
-        return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD.'}), 400
-    
-    report = defaultdict(dict)
-    all_student_ids = [uid for uid, uinfo in data['users'].items() if uinfo['type'] == 'student']
-    
-    for day_delta in range((to_date - from_date).days + 1):
-        current_date = from_date + timedelta(days=day_delta)
-        date_str = current_date.strftime('%Y-%m-%d')
-        
-        for student_id in all_student_ids:
-            history_for_day = [rec for rec in data['attendance_history'].get(student_id, []) 
-                            if rec['date'] == date_str]
-            
-            if not history_for_day:
-                report[date_str][student_id] = 'Absent'
-            else:
-                present_count = sum(1 for r in history_for_day if r['status'] == 'Present')
-                if present_count > 0:
-                    report[date_str][student_id] = 'Present'
-                else:
-                    report[date_str][student_id] = 'Absent'
-    
-    return jsonify(dict(sorted(report.items())))
-
-@app.route('/send_message', methods=['POST'])
-def send_message():
+@app.route('/override_attendance', methods=['POST'])
+def override_attendance():
     req = request.json
-    from_id = req.get('from_id')
-    to_username = req.get('to_username')
-    content = req.get('content')
+    teacher_id = req.get('teacher_id')
+    student_id = req.get('student_id')
+    status = req.get('status')
     
-    if not all([from_id, to_username, content]):
-        return jsonify({'error': 'Missing required fields'}), 400
-        
-    # Find recipient
-    recipient_id, recipient_info = next(((uid, uinfo) for uid, uinfo in data['users'].items() 
-                                      if uinfo['username'] == to_username), (None, None))
-    if not recipient_id:
-        return jsonify({'error': 'Recipient not found'}), 404
-        
-    # Store message (in a real app, you'd have a messages table)
-    if 'messages' not in data:
-        data['messages'] = []
-        
-    data['messages'].append({
-        'from_id': from_id,
-        'from_name': data['users'][from_id]['name'],
-        'to_id': recipient_id,
-        'content': content,
-        'timestamp': get_current_time().isoformat()
+    if (teacher_id not in db.users or 
+        db.users[teacher_id]['type'] != 'teacher' or
+        student_id not in db.users):
+        return jsonify({'error': 'Invalid request'}), 400
+
+    db.attendance_history[student_id].append({
+        'date': get_utc_now().date().isoformat(),
+        'lecture': 'MANUAL_OVERRIDE',
+        'status': status,
+        'by': teacher_id
     })
-    
-    return jsonify({'message': 'Message sent'}), 200
+    return jsonify({'message': 'Attendance updated'})
 
-@app.route('/messages/<user_id>', methods=['GET'])
-def get_messages(user_id):
-    if user_id not in data['users']:
-        return jsonify({'error': 'User not found'}), 404
-        
-    messages = []
-    if 'messages' in data:
-        messages = [msg for msg in data['messages'] if msg['to_id'] == user_id or msg['from_id'] == user_id]
-    
-    return jsonify({'messages': messages})
-
-# --- Background Processing ---
+# Background Services
 def attendance_processor():
+    """Process attendance at lecture end"""
     while True:
-        now = get_current_time()
-        today_date_str = now.strftime('%Y-%m-%d')
+        now = get_utc_now()
+        today = now.date().isoformat()
         
-        # Process each class
-        for class_id, timetable in data['timetable'].items():
+        for class_id, timetable in db.timetable.items():
             day_schedule = timetable.get(now.strftime('%A'), {})
-            
-            # Process each lecture slot
             for time_slot, subject in day_schedule.items():
-                try:
-                    start_str, end_str = time_slot.split('-')
-                    start_time = parse_time(start_str.strip())
-                    end_time = parse_time(end_str.strip())
+                start_str, end_str = time_slot.split('-')
+                end_time = datetime.strptime(end_str.strip(), "%H:%M").time()
+                
+                if now.time() > end_time:
+                    lecture_id = f"{today}-{class_id}-{time_slot}"
                     
-                    # If current time is after lecture end time
-                    if now.time() > end_time:
-                        lecture_duration = (datetime.combine(now.date(), end_time) - 
-                                         datetime.combine(now.date(), start_time)).total_seconds()
-                        required_time = lecture_duration * 0.85
-                        
-                        # Check all students in this class
-                        for student_id, user_info in data['users'].items():
-                            if user_info.get('class_id') == class_id:
-                                live_info = data['live_attendance'][student_id]
-                                lecture_str = f"{time_slot} ({subject})"
-                                
-                                # Only process if we haven't recorded attendance for this lecture yet
-                                existing_records = [r for r in data['attendance_history'].get(student_id, []) 
-                                                  if r['date'] == today_date_str and r['lecture'] == lecture_str]
-                                
-                                if not existing_records:
-                                    status = 'Present' if live_info.get('accumulated_time', 0) >= required_time else 'Absent'
-                                    data['attendance_history'][student_id].append({
-                                        'date': today_date_str,
-                                        'lecture': lecture_str,
-                                        'status': status,
-                                        'timestamp': now.isoformat()
-                                    })
-                except ValueError:
-                    continue
-        
-        time.sleep(60)  # Check every minute
+                    # Calculate required attendance time (85% of lecture)
+                    start_dt = datetime.combine(now.date(), 
+                        datetime.strptime(start_str.strip(), "%H:%M").time())
+                    end_dt = datetime.combine(now.date(), end_time)
+                    lecture_duration = (end_dt - start_dt).total_seconds()
+                    required_time = lecture_duration * 0.85
+                    
+                    # Process attendance for class students
+                    for student_id, user_info in db.users.items():
+                        if (user_info['type'] == 'student' and 
+                            user_info.get('class_id') == class_id):
+                            
+                            live_info = db.live_attendance[student_id]
+                            status = 'Present' if live_info['accumulated_time'] >= required_time else 'Absent'
+                            
+                            db.attendance_history[student_id].append({
+                                'date': today,
+                                'lecture': f"{time_slot} ({subject})",
+                                'status': status
+                            })
+        time.sleep(60)
 
 def session_cleanup():
+    """Clean inactive sessions"""
     while True:
-        now = get_current_time()
-        for student_id, live_info in list(data['live_attendance'].items()):
-            if live_info.get('last_ping') and (now - live_info['last_ping']).total_seconds() > 30:
-                live_info['active'] = False
-                live_info['attendance_timer'] = False
-        time.sleep(15)
+        now = get_utc_now()
+        inactive = []
+        
+        for device_id, user_id in db.active_sessions.items():
+            if user_id in db.live_attendance:
+                last_ping = db.live_attendance[user_id]['last_ping']
+                if last_ping and (now - last_ping).total_seconds() > 300:  # 5 min timeout
+                    inactive.append(device_id)
+        
+        for device_id in inactive:
+            db.active_sessions.pop(device_id, None)
+        
+        time.sleep(60)
 
 if __name__ == "__main__":
     threading.Thread(target=attendance_processor, daemon=True).start()
     threading.Thread(target=session_cleanup, daemon=True).start()
     app.run(host="0.0.0.0", port=10000, debug=False)
-
-# --- END OF FILE main.py ---
