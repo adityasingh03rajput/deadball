@@ -1,3 +1,5 @@
+# --- START OF FILE main.py ---
+
 from flask import Flask, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
@@ -9,9 +11,10 @@ import pytz
 
 app = Flask(__name__)
 
-# In-memory data store
+# --- In-memory data store (simulating a database) ---
 data = {
     'users': {
+        # Sample teacher
         'teacher1': {
             'username': 'teacher',
             'password_hash': generate_password_hash('teacher123'),
@@ -20,9 +23,9 @@ data = {
         }
     },
     'live_attendance': defaultdict(lambda: {
-        'active': False,
-        'current_lecture': None,
-        'accumulated_time': 0,
+        'active': False, 
+        'current_lecture': None, 
+        'accumulated_time': 0, 
         'last_ping': None,
         'attendance_timer': False,
         'attendance_start': None
@@ -40,6 +43,7 @@ data = {
                 "14:40-15:40": "Computer Science",
                 "15:40-16:40": "Physical Education"
             },
+            # Other days similarly...
         }
     },
     'settings': {
@@ -51,6 +55,7 @@ data = {
 
 TIMEZONE = 'Asia/Kolkata'
 
+# --- Utility Functions ---
 def get_current_time():
     return datetime.now(pytz.timezone(TIMEZONE))
 
@@ -81,6 +86,7 @@ def calculate_attendance_status(student_id, lecture):
     if not lecture or not live_info['attendance_timer']:
         return 'Absent'
     
+    # Calculate required time (85% of lecture duration)
     time_slot = lecture.split(' (')[0]
     start_str, end_str = time_slot.split('-')
     start_time = parse_time(start_str.strip())
@@ -93,6 +99,7 @@ def calculate_attendance_status(student_id, lecture):
         return 'Present'
     return 'Absent'
 
+# --- User & Session Management ---
 @app.route('/teacher/register', methods=['POST'])
 def teacher_register():
     req = request.json
@@ -158,6 +165,7 @@ def logout():
         del data['active_sessions'][device_id]
     return jsonify({'message': 'Logged out'}), 200
 
+# --- Teacher Endpoints ---
 @app.route('/student/register', methods=['POST'])
 def student_register():
     req = request.json
@@ -194,9 +202,10 @@ def manage_timetable():
 def manage_bssid():
     if request.method == 'POST':
         bssids = request.json.get('bssids', [])
+        # Validate BSSID format
         valid_bssids = []
         for bssid in bssids:
-            if len(bssid.split(':')) == 6:
+            if len(bssid.split(':')) == 6:  # Basic validation
                 valid_bssids.append(bssid.lower())
         data['settings']['authorized_bssids'] = valid_bssids
         return jsonify({'message': 'BSSID list updated'}), 200
@@ -227,10 +236,12 @@ def get_student_profile(student_id):
     if student_id not in data['users'] or data['users'][student_id]['type'] != 'student':
         return jsonify({'error': 'Student not found'}), 404
         
+    # Calculate attendance stats
     history = data['attendance_history'].get(student_id, [])
     present_count = sum(1 for r in history if r['status'] == 'Present')
     total_count = len(history)
     
+    # Group by lecture to find most missed
     lecture_stats = defaultdict(int)
     for record in history:
         if record['status'] == 'Absent':
@@ -248,6 +259,7 @@ def get_student_profile(student_id):
         'detailed_report': history
     })
 
+# --- Session Management ---
 @app.route('/session/status', methods=['GET'])
 def get_session_status():
     return jsonify({
@@ -274,6 +286,7 @@ def random_ring():
     if len(students) < 2:
         return jsonify({'error': 'Not enough students'}), 400
     
+    # Get attendance stats for all students
     attendance_stats = []
     for student_id in students:
         history = data['attendance_history'].get(student_id, [])
@@ -282,11 +295,13 @@ def random_ring():
         attendance_percent = (present_count / total_count * 100) if total_count > 0 else 0
         attendance_stats.append((student_id, attendance_percent))
     
+    # Sort by attendance percentage
     attendance_stats.sort(key=lambda x: x[1])
     
+    # Select one from top (high attendance) and one from bottom (low attendance)
     selected = [
-        attendance_stats[0][0],
-        attendance_stats[-1][0]
+        attendance_stats[0][0],  # Lowest attendance
+        attendance_stats[-1][0]  # Highest attendance
     ]
     
     data['settings']['random_rings'] = selected
@@ -295,6 +310,7 @@ def random_ring():
         'students': selected
     })
 
+# --- Attendance Management ---
 @app.route('/ping', methods=['POST'])
 def ping():
     PING_INTERVAL = 10
@@ -322,6 +338,7 @@ def ping():
         live_data['active'] = True
         live_data['accumulated_time'] += PING_INTERVAL
         
+        # Update status based on attendance timer
         if status == 'present' and not live_data['attendance_timer']:
             live_data['attendance_timer'] = True
             live_data['attendance_start'] = get_current_time()
@@ -349,6 +366,7 @@ def complete_attendance():
     live_data = data['live_attendance'][student_id]
     live_data['accumulated_time'] += duration
     
+    # Mark attendance for current date
     today = get_current_time().strftime('%Y-%m-%d')
     data['attendance_history'][student_id].append({
         'date': today,
@@ -424,6 +442,7 @@ def get_academic_info(student_id):
     present_count = sum(1 for r in history if r['status'] == 'Present')
     total_count = len(history)
     
+    # Get today's status
     today = get_current_time().strftime('%Y-%m-%d')
     today_status = "Unknown"
     today_records = [r for r in history if r['date'] == today]
@@ -481,11 +500,13 @@ def send_message():
     if not all([from_id, to_username, content]):
         return jsonify({'error': 'Missing required fields'}), 400
         
+    # Find recipient
     recipient_id, recipient_info = next(((uid, uinfo) for uid, uinfo in data['users'].items() 
                                       if uinfo['username'] == to_username), (None, None))
     if not recipient_id:
         return jsonify({'error': 'Recipient not found'}), 404
         
+    # Store message (in a real app, you'd have a messages table)
     if 'messages' not in data:
         data['messages'] = []
         
@@ -510,30 +531,36 @@ def get_messages(user_id):
     
     return jsonify({'messages': messages})
 
+# --- Background Processing ---
 def attendance_processor():
     while True:
         now = get_current_time()
         today_date_str = now.strftime('%Y-%m-%d')
         
+        # Process each class
         for class_id, timetable in data['timetable'].items():
             day_schedule = timetable.get(now.strftime('%A'), {})
             
+            # Process each lecture slot
             for time_slot, subject in day_schedule.items():
                 try:
                     start_str, end_str = time_slot.split('-')
                     start_time = parse_time(start_str.strip())
                     end_time = parse_time(end_str.strip())
                     
+                    # If current time is after lecture end time
                     if now.time() > end_time:
                         lecture_duration = (datetime.combine(now.date(), end_time) - 
                                          datetime.combine(now.date(), start_time)).total_seconds()
                         required_time = lecture_duration * 0.85
                         
+                        # Check all students in this class
                         for student_id, user_info in data['users'].items():
                             if user_info.get('class_id') == class_id:
                                 live_info = data['live_attendance'][student_id]
                                 lecture_str = f"{time_slot} ({subject})"
                                 
+                                # Only process if we haven't recorded attendance for this lecture yet
                                 existing_records = [r for r in data['attendance_history'].get(student_id, []) 
                                                   if r['date'] == today_date_str and r['lecture'] == lecture_str]
                                 
@@ -548,7 +575,7 @@ def attendance_processor():
                 except ValueError:
                     continue
         
-        time.sleep(60)
+        time.sleep(60)  # Check every minute
 
 def session_cleanup():
     while True:
@@ -563,3 +590,5 @@ if __name__ == "__main__":
     threading.Thread(target=attendance_processor, daemon=True).start()
     threading.Thread(target=session_cleanup, daemon=True).start()
     app.run(host="0.0.0.0", port=10000, debug=False)
+
+# --- END OF FILE main.py ---
