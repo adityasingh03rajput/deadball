@@ -1,218 +1,204 @@
+# -----------------------------
+# main_server.py
+# -----------------------------
+
 from flask import Flask, request, jsonify
-from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta
+from collections import defaultdict
 import threading
 import time
-import random
-from datetime import datetime
+import uuid
+import pytz
 
 app = Flask(__name__)
-CORS(app)
 
-# =========================
-# IN-MEMORY DATABASE
-# =========================
-db = {
-    "students": {},  # student_id: {details}
-    "teachers": {},  # teacher_id: {details}
-    "authorized_bssids": [],
-    "current_session": None,
-    "session_log": []
+TIMEZONE = 'Asia/Kolkata'
+PING_INTERVAL = 10
+
+# In-memory data store
+store = {
+    'users': {},
+    'active_sessions': {},
+    'live_attendance': defaultdict(lambda: {
+        'active': False,
+        'current_lecture': None,
+        'accumulated_time': 0,
+        'last_ping': None,
+        'attendance_timer': False,
+        'attendance_start': None
+    }),
+    'attendance_history': defaultdict(list),
+    'timetable': {},
+    'settings': {
+        'authorized_bssids': [],
+        'session_active': False,
+        'random_rings': []
+    }
 }
 
-lock = threading.Lock()
+def get_current_time():
+    return datetime.now(pytz.timezone(TIMEZONE))
 
-# =========================
-# UTILITIES
-# =========================
-def get_attendance_status(timer_status):
-    return {
-        "stopped": "Absent",
-        "running": "Pending",
-        "paused": "On Bunk",
-        "completed": "Attended"
-    }.get(timer_status, "Unknown")
+def parse_time(tstr):
+    return datetime.strptime(tstr, "%H:%M").time()
 
-def current_time_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def get_current_lecture(class_id):
+    now = get_current_time()
+    today = now.strftime('%A')
+    current_time = now.time()
+    for slot, subject in store['timetable'].get(class_id, {}).get(today, {}).items():
+        start, end = slot.split('-')
+        if parse_time(start) <= current_time <= parse_time(end):
+            return f"{slot} ({subject})"
+    return None
 
-# =========================
-# BACKGROUND TIMER THREAD
-# =========================
-def update_timers():
-    while True:
-        with lock:
-            for student_id, student in db["students"].items():
-                timer = student.get("timer", {})
-                if timer.get("running"):
-                    now = time.time()
-                    elapsed = now - timer["last_update"]
-                    timer["remaining"] -= elapsed
-                    timer["last_update"] = now
-                    if timer["remaining"] <= 0:
-                        timer.update({
-                            "remaining": 0,
-                            "running": False,
-                            "status": "completed"
-                        })
-                        student["attendance_status"] = "Attended"
-                        student["leave_time"] = current_time_str()
-        time.sleep(1)
+def calculate_status(sid, lecture):
+    info = store['live_attendance'][sid]
+    if not lecture or not info['attendance_timer']:
+        return 'Absent'
+    slot = lecture.split(' (')[0]
+    s, e = slot.split('-')
+    duration = (datetime.combine(datetime.today(), parse_time(e)) - datetime.combine(datetime.today(), parse_time(s))).total_seconds()
+    return 'Present' if info['accumulated_time'] >= duration * 0.85 else 'Absent'
 
-threading.Thread(target=update_timers, daemon=True).start()
+@app.route('/login', methods=['POST'])
+def login():
+    req = request.json
+    username = req.get('username')
+    password = req.get('password')
+    device_id = req.get('device_id')
+    user = next(((uid, u) for uid, u in store['users'].items() if u['username'] == username), (None, None))
+    if not user[0] or not check_password_hash(user[1]['password_hash'], password):
+        return jsonify({'error': 'Invalid credentials'}), 401
+    uid, info = user
+    store['active_sessions'][device_id] = uid
+    res = {'message': 'Login successful', 'user_id': uid, 'type': info['type'], 'name': info['name']}
+    if info['type'] == 'student':
+        res['class_id'] = info['class_id']
+    return jsonify(res)
 
-# =========================
-# TEACHER ACTIONS
-# =========================
-@app.route('/set_bssid', methods=['POST'])
-def set_bssid():
-    bssids = request.json.get("bssids", [])
-    with lock:
-        db["authorized_bssids"] = bssids
-    return jsonify({"message": "BSSIDs updated", "bssids": bssids})
+@app.route('/teacher/register', methods=['POST'])
+def register_teacher():
+    req = request.json
+    uid = str(uuid.uuid4())
+    store['users'][uid] = {
+        'username': req['username'],
+        'password_hash': generate_password_hash(req['password']),
+        'type': 'teacher',
+        'name': req.get('name', req['username'])
+    }
+    return jsonify({'message': 'Registered'}), 201
 
-@app.route('/start_session', methods=['POST'])
-def start_session():
-    session_name = request.json.get("session_name")
-    with lock:
-        db["current_session"] = {
-            "name": session_name,
-            "start_time": current_time_str(),
-            "students_present": []
-        }
-        for student in db["students"].values():
-            student["attendance_status"] = "Absent"
-            student["join_time"] = None
-            student["leave_time"] = None
-    return jsonify({"message": f"Session '{session_name}' started"})
+@app.route('/student/register', methods=['POST'])
+def register_student():
+    req = request.json
+    uid = str(uuid.uuid4())
+    store['users'][uid] = {
+        'username': req['username'],
+        'password_hash': generate_password_hash(req['password']),
+        'type': 'student',
+        'name': req['name'],
+        'class_id': req['class_id']
+    }
+    return jsonify({'message': 'Student registered', 'user_id': uid}), 201
 
-@app.route('/end_session', methods=['POST'])
-def end_session():
-    with lock:
-        session = db["current_session"]
-        if session:
-            session["end_time"] = current_time_str()
-            db["session_log"].append(session)
-            db["current_session"] = None
-            return jsonify({"message": "Session ended"})
-        else:
-            return jsonify({"error": "No active session"}), 400
+@app.route('/ping', methods=['POST'])
+def ping():
+    sid = request.json.get('student_id')
+    device = request.json.get('device_id')
+    status = request.json.get('status')
+    if device not in store['active_sessions']:
+        return jsonify({'error': 'Session expired'}), 401
+    if sid != store['active_sessions'][device]:
+        return jsonify({'error': 'Invalid ID'}), 401
+    info = store['live_attendance'][sid]
+    info['last_ping'] = get_current_time()
+    lec = get_current_lecture(store['users'][sid].get('class_id'))
+    if lec:
+        if info['current_lecture'] != lec:
+            info['current_lecture'] = lec
+            info['accumulated_time'] = 0
+        info['active'] = True
+        info['accumulated_time'] += PING_INTERVAL
+        if status == 'present':
+            info['attendance_timer'] = True
+            info['attendance_start'] = get_current_time()
+    else:
+        info['active'] = False
+        info['current_lecture'] = None
+        info['attendance_timer'] = False
+    return jsonify({
+        'status': 'pong',
+        'current_lecture': info['current_lecture'],
+        'accumulated_time': info['accumulated_time']
+    })
 
-@app.route('/random_ring', methods=['POST'])
-def random_ring():
-    with lock:
-        students = list(db["students"].items())
-        attended = [sid for sid, s in students if s.get("attendance_status") == "Attended"]
-        absent = [sid for sid, s in students if s.get("attendance_status") == "Absent"]
-        selection = []
-        if attended:
-            selection.append(random.choice(attended))
-        if absent:
-            selection.append(random.choice(absent))
-    return jsonify({"selected_students": selection})
+@app.route('/complete_attendance', methods=['POST'])
+def complete_attendance():
+    req = request.json
+    sid = req['student_id']
+    lec = get_current_lecture(store['users'][sid]['class_id'])
+    store['attendance_history'][sid].append({
+        'date': get_current_time().strftime('%Y-%m-%d'),
+        'lecture': lec,
+        'status': 'Present',
+        'timestamp': get_current_time().isoformat()
+    })
+    return jsonify({'message': 'Marked'}), 200
 
-# =========================
-# STUDENT ACTIONS
-# =========================
-@app.route('/student/connect', methods=['POST'])
-def student_connect():
-    student_id = request.json.get("student_id")
-    bssid = request.json.get("bssid")
+@app.route('/student/profile/<sid>', methods=['GET'])
+def student_profile(sid):
+    history = store['attendance_history'].get(sid, [])
+    pcount = sum(1 for r in history if r['status'] == 'Present')
+    total = len(history)
+    return jsonify({
+        'name': store['users'][sid]['name'],
+        'class_id': store['users'][sid].get('class_id'),
+        'present_lectures': pcount,
+        'total_lectures': total,
+        'attendance_percent': (pcount / total * 100) if total > 0 else 0,
+        'detailed_report': history
+    })
 
-    if not student_id or not bssid:
-        return jsonify({"error": "student_id and bssid required"}), 400
+@app.route('/timetable', methods=['GET', 'POST'])
+def timetable():
+    if request.method == 'POST':
+        store['timetable'] = request.json
+        return jsonify({'message': 'Updated'}), 200
+    return jsonify(store['timetable'])
 
-    with lock:
-        student = db["students"].setdefault(student_id, {
-            "name": f"Student {student_id}",
-            "timer": {
-                "duration": 120,
-                "remaining": 0,
-                "running": False,
-                "last_update": None,
-                "status": "stopped"
-            },
-            "connected": False,
-            "authorized": False,
-            "attendance_status": "Absent",
-            "join_time": None,
-            "leave_time": None
+@app.route('/live_data', methods=['GET'])
+def live_data():
+    output = {'students': []}
+    for sid, info in store['live_attendance'].items():
+        user = store['users'].get(sid, {})
+        status = calculate_status(sid, info.get('current_lecture'))
+        last = info.get('last_ping')
+        output['students'].append({
+            'id': sid,
+            'name': user.get('name'),
+            'class_id': user.get('class_id'),
+            'status': status,
+            'current_lecture': info.get('current_lecture'),
+            'accumulated_time': info.get('accumulated_time', 0),
+            'last_update': last.strftime('%Y-%m-%d %H:%M:%S') if last else 'Never'
         })
+    return jsonify(output)
 
-        is_authorized = bssid in db["authorized_bssids"]
-        student["connected"] = True
-        student["authorized"] = is_authorized
+@app.route('/session/status', methods=['GET'])
+def session_status():
+    return jsonify({'session_active': store['settings']['session_active']})
 
-        if is_authorized:
-            student["attendance_status"] = "Pending"
-            student["join_time"] = current_time_str()
+@app.route('/session/start', methods=['POST'])
+def session_start():
+    store['settings']['session_active'] = True
+    return jsonify({'message': 'Session started'})
 
-        return jsonify({
-            "authorized": is_authorized,
-            "attendance_status": student["attendance_status"]
-        })
+@app.route('/session/end', methods=['POST'])
+def session_end():
+    store['settings']['session_active'] = False
+    return jsonify({'message': 'Session ended'})
 
-@app.route('/student/timer/start', methods=['POST'])
-def start_timer():
-    student_id = request.json.get("student_id")
-    with lock:
-        student = db["students"].get(student_id)
-        if not student:
-            return jsonify({"error": "Student not found"}), 404
-        if not student["authorized"]:
-            return jsonify({"error": "Not authorized"}), 403
-
-        student["timer"] = {
-            "duration": 120,
-            "remaining": 120,
-            "running": True,
-            "last_update": time.time(),
-            "status": "running"
-        }
-        student["attendance_status"] = "Pending"
-    return jsonify({"message": "Timer started"})
-
-@app.route('/mark_present', methods=['POST'])
-def mark_present():
-    student_id = request.json.get("student_id")
-    with lock:
-        student = db["students"].get(student_id)
-        if student:
-            student["attendance_status"] = "Attended"
-            student["timer"]["status"] = "completed"
-            student["timer"]["running"] = False
-            student["timer"]["remaining"] = 0
-            student["leave_time"] = current_time_str()
-            return jsonify({"message": "Marked present"})
-        return jsonify({"error": "Student not found"}), 404
-
-# =========================
-# STATUS FOR FRONTEND
-# =========================
-@app.route('/get_status', methods=['GET'])
-def get_status():
-    with lock:
-        students_status = {}
-        for sid, student in db["students"].items():
-            timer = student.get("timer", {})
-            attendance = student.get("attendance_status", "Unknown")
-            students_status[sid] = {
-                "name": student["name"],
-                "timer": timer,
-                "connected": student["connected"],
-                "authorized": student["authorized"],
-                "attendance_status": attendance,
-                "join_time": student.get("join_time"),
-                "leave_time": student.get("leave_time")
-            }
-
-        return jsonify({
-            "authorized_bssids": db["authorized_bssids"],
-            "students": students_status,
-            "current_session": db["current_session"]
-        })
-
-# =========================
-# START APP
-# =========================
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(debug=True)
