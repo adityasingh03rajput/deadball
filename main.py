@@ -2,127 +2,148 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import time
 import threading
-from datetime import datetime, timezone
-import random
-import os
-from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 CORS(app)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or 'your-secret-key-here'
 
-# Enhanced in-memory database with persistence option
-class Database:
-    def __init__(self):
-        self.data = {
-            "students": {},
-            "authorized_bssids": set(),
-            "sessions": {},
-            "current_session": None,
-            "teachers": {
-                "admin": generate_password_hash("admin123")
-            }
-        }
-        self.lock = threading.Lock()
+# In-memory database
+data = {
+    "students": {},  # student_id -> {...}
+    "authorized_bssid": None
+}
 
-db = Database()
+lock = threading.Lock()
 
-# Authentication decorator
-def teacher_required(f):
-    def wrapper(*args, **kwargs):
-        auth = request.authorization
-        if not auth or not auth.username or not auth.password:
-            return jsonify({"error": "Authentication required"}), 401
-        
-        with db.lock:
-            if auth.username not in db.data["teachers"]:
-                return jsonify({"error": "Invalid credentials"}), 403
-            
-            if not check_password_hash(db.data["teachers"][auth.username], auth.password):
-                return jsonify({"error": "Invalid credentials"}), 403
-        
-        return f(*args, **kwargs)
-    return wrapper
-
-# Background timer thread
+# Timer update thread
 def update_timers():
     while True:
-        with db.lock:
-            current_time = time.time()
-            for student_id, student in db.data["students"].items():
-                if student["timer"]["running"]:
-                    elapsed = current_time - student["timer"]["last_update"]
-                    remaining = max(0, student["timer"]["remaining"] - elapsed)
-                    
-                    # Only update if significant change (reduce lock contention)
-                    if abs(remaining - student["timer"]["remaining"]) >= 1:
-                        student["timer"]["remaining"] = remaining
-                        student["timer"]["last_update"] = current_time
-                        
-                        if student["timer"]["remaining"] <= 0:
-                            student["timer"]["running"] = False
-                            student["timer"]["status"] = "completed"
-                            student["attendance_status"] = "present"
-        time.sleep(0.5)
+        with lock:
+            for student in data["students"].values():
+                timer = student["timer"]
+                if timer["running"]:
+                    now = time.time()
+                    elapsed = now - timer["last_update"]
+                    timer["remaining"] = max(0, timer["remaining"] - elapsed)
+                    timer["last_update"] = now
+                    if timer["remaining"] <= 0:
+                        timer["running"] = False
+                        timer["status"] = "completed"
+        time.sleep(1)
 
 threading.Thread(target=update_timers, daemon=True).start()
 
 @app.route('/set_bssid', methods=['POST'])
-@teacher_required
 def set_bssid():
-    bssids = request.json.get('bssids', [])
-    if not isinstance(bssids, list):
-        return jsonify({"error": "BSSIDs must be an array"}), 400
-    
-    with db.lock:
-        db.data["authorized_bssids"] = set(bssids)
-    return jsonify({"message": f"Authorized BSSIDs updated", "count": len(bssids)})
+    bssid = request.json.get('bssid')
+    if not bssid:
+        return jsonify({"error": "BSSID required"}), 400
+    with lock:
+        data["authorized_bssid"] = bssid
+    return jsonify({"message": f"Authorized BSSID set to {bssid}"}), 200
 
-# Add similar @teacher_required decorator to other teacher endpoints
+@app.route('/student/connect', methods=['POST'])
+def student_connect():
+    student_id = request.json.get('student_id')
+    bssid = request.json.get('bssid')
 
-@app.route('/student/status/<student_id>', methods=['GET'])
-def student_status(student_id):
-    with db.lock:
-        if student_id not in db.data["students"]:
-            return jsonify({"error": "Student not found"}), 404
-        
-        student = db.data["students"][student_id]
+    if not student_id or not bssid:
+        return jsonify({"error": "Student ID and BSSID required"}), 400
+
+    with lock:
+        if student_id not in data["students"]:
+            data["students"][student_id] = {
+                "timer": {
+                    "duration": 300,
+                    "remaining": 0,
+                    "running": False,
+                    "last_update": None,
+                    "status": "stopped"
+                },
+                "connected": False,
+                "authorized": False
+            }
+
+        student = data["students"][student_id]
+        student["connected"] = True
+        student["authorized"] = (bssid == data["authorized_bssid"])
+
         return jsonify({
-            "timer_status": student["timer"]["status"],
-            "time_remaining": student["timer"]["remaining"],
-            "wifi_status": "authorized" if student["authorized"] else "unauthorized" if student["connected"] else "disconnected",
-            "attendance": student["attendance_status"]
-        })
+            "authorized": student["authorized"],
+            "message": "Connected"
+        }), 200
 
-# Add endpoint for bulk operations
-@app.route('/students/bulk_action', methods=['POST'])
-@teacher_required
-def bulk_action():
-    action = request.json.get('action')
-    student_ids = request.json.get('student_ids', [])
-    
-    if action not in ["start_timer", "stop_timer", "mark_present"]:
+@app.route('/student/timer/<action>', methods=['POST'])
+def timer_action(action):
+    student_id = request.json.get('student_id')
+    if not student_id:
+        return jsonify({"error": "Student ID required"}), 400
+    if action not in ["start", "pause", "stop"]:
         return jsonify({"error": "Invalid action"}), 400
-    
-    results = {}
-    with db.lock:
-        for student_id in student_ids:
-            if student_id in db.data["students"]:
-                student = db.data["students"][student_id]
-                
-                if action == "start_timer":
-                    if student["authorized"]:
-                        student["timer"] = {
-                            "duration": 120,
-                            "remaining": 120,
-                            "running": True,
-                            "last_update": time.time(),
-                            "status": "running"
-                        }
-                        results[student_id] = "success"
-                # Implement other actions...
-    
-    return jsonify({"results": results})
+
+    with lock:
+        if student_id not in data["students"]:
+            return jsonify({"error": "Student not found"}), 404
+
+        student = data["students"][student_id]
+        timer = student["timer"]
+
+        if action == "start":
+            if not student["authorized"]:
+                return jsonify({"error": "Not authorized"}), 403
+            timer.update({
+                "duration": 300,
+                "remaining": 300,
+                "running": True,
+                "last_update": time.time(),
+                "status": "running"
+            })
+        elif action == "pause":
+            if not timer["running"]:
+                return jsonify({"error": "Timer not running"}), 400
+            timer["running"] = False
+            timer["status"] = "paused"
+        elif action == "stop":
+            timer.update({
+                "duration": 300,
+                "remaining": 0,
+                "running": False,
+                "last_update": None,
+                "status": "stopped"
+            })
+
+    return jsonify({"message": f"Timer {action}ed"}), 200
+
+@app.route('/get_status', methods=['GET'])
+def get_status():
+    with lock:
+        return jsonify({
+            "authorized_bssid": data["authorized_bssid"],
+            "students": data["students"]
+        }), 200
+
+@app.route('/student/<student_id>', methods=['GET'])
+def get_student(student_id):
+    with lock:
+        if student_id not in data["students"]:
+            return jsonify({"error": "Student not found"}), 404
+        return jsonify(data["students"][student_id]), 200
+
+@app.route('/reset_all', methods=['POST'])
+def reset_all():
+    with lock:
+        for student in data["students"].values():
+            student.update({
+                "connected": False,
+                "authorized": False,
+                "timer": {
+                    "duration": 300,
+                    "remaining": 0,
+                    "running": False,
+                    "last_update": None,
+                    "status": "stopped"
+                }
+            })
+    return jsonify({"message": "All students reset"}), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    app.run(host='0.0.0.0', port=5000)
