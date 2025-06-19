@@ -1,9 +1,12 @@
+# server.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import threading
 import time
 import random
 from datetime import datetime
+import hashlib
+import secrets
 
 app = Flask(__name__)
 CORS(app)
@@ -12,11 +15,12 @@ CORS(app)
 # IN-MEMORY DATABASE
 # =========================
 db = {
-    "students": {},  # student_id: {details}
-    "teachers": {},  # teacher_id: {details}
-    "authorized_bssids": [],
-    "current_session": None,
-    "session_log": []
+    "students": {},          # student_id: {details}
+    "teachers": {},          # teacher_id: {details, password_hash, salt}
+    "authorized_bssids": [], # List of authorized WiFi BSSIDs
+    "current_session": None, # Current active session
+    "session_log": [],       # History of past sessions
+    "random_rings": {}       # Track random student selections
 }
 
 lock = threading.Lock()
@@ -26,6 +30,16 @@ lock = threading.Lock()
 # =========================
 def current_time_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def hash_password(password, salt=None):
+    if salt is None:
+        salt = secrets.token_hex(16)
+    hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+    return salt, hashed.hex()
+
+def verify_password(stored_salt, stored_hash, password):
+    _, new_hash = hash_password(password, stored_salt)
+    return new_hash == stored_hash
 
 def initialize_student(student_id):
     return {
@@ -41,7 +55,18 @@ def initialize_student(student_id):
         "authorized": False,
         "attendance_status": "Absent",
         "join_time": None,
-        "leave_time": None
+        "leave_time": None,
+        "last_seen": None,
+        "device_id": None
+    }
+
+def initialize_teacher(teacher_id, name, password):
+    salt, password_hash = hash_password(password)
+    return {
+        "name": name,
+        "password_hash": password_hash,
+        "salt": salt,
+        "registered": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
 # =========================
@@ -67,15 +92,96 @@ def update_timers():
                         student["attendance_status"] = "Attended"
                         student["leave_time"] = current_time_str()
                         
-                        # Add to session's present students if session exists
-                        if db["current_session"]:
-                            if student_id not in db["current_session"]["students_present"]:
-                                db["current_session"]["students_present"].append(student_id)
+                        if db["current_session"] and student_id not in db["current_session"]["students_present"]:
+                            db["current_session"]["students_present"].append(student_id)
+            
+            # Clean up old random rings
+            current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            to_delete = []
+            for ring_id, ring_data in db["random_rings"].items():
+                ring_time = datetime.strptime(ring_data["time"], "%Y-%m-%d %H:%M:%S")
+                if (datetime.now() - ring_time).total_seconds() > 300:  # 5 minutes expiration
+                    to_delete.append(ring_id)
+            
+            for ring_id in to_delete:
+                del db["random_rings"][ring_id]
+                
         time.sleep(1)
 
 # Start the timer thread
 timer_thread = threading.Thread(target=update_timers, daemon=True)
 timer_thread.start()
+
+# =========================
+# AUTHENTICATION ENDPOINTS
+# =========================
+@app.route('/register_teacher', methods=['POST'])
+def register_teacher():
+    try:
+        data = request.json
+        teacher_id = data.get("teacher_id")
+        name = data.get("name")
+        password = data.get("password")
+        
+        if not all([teacher_id, name, password]):
+            return jsonify({"error": "teacher_id, name and password are required"}), 400
+            
+        with lock:
+            if teacher_id in db["teachers"]:
+                return jsonify({"error": "Teacher already exists"}), 400
+                
+            db["teachers"][teacher_id] = initialize_teacher(teacher_id, name, password)
+            
+        return jsonify({"message": "Teacher registered successfully"})
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/login', methods=['POST'])
+def login():
+    try:
+        data = request.json
+        username = data.get("username")
+        password = data.get("password")
+        user_type = data.get("type")
+        device_id = data.get("device_id", "")
+        
+        if not all([username, password, user_type]):
+            return jsonify({"error": "username, password and type are required"}), 400
+            
+        with lock:
+            if user_type == "teacher":
+                if username not in db["teachers"]:
+                    return jsonify({"error": "Teacher not found"}), 404
+                    
+                teacher = db["teachers"][username]
+                if not verify_password(teacher["salt"], teacher["password_hash"], password):
+                    return jsonify({"error": "Invalid password"}), 401
+                    
+                return jsonify({
+                    "message": "Login successful",
+                    "type": "teacher",
+                    "name": teacher["name"]
+                })
+                
+            elif user_type == "student":
+                if username not in db["students"]:
+                    db["students"][username] = initialize_student(username)
+                    
+                # Update student device info
+                db["students"][username]["device_id"] = device_id
+                db["students"][username]["last_seen"] = current_time_str()
+                
+                return jsonify({
+                    "message": "Login successful",
+                    "type": "student"
+                })
+                
+            else:
+                return jsonify({"error": "Invalid user type"}), 400
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # =========================
 # TEACHER ENDPOINTS
@@ -163,9 +269,17 @@ def random_ring():
             if absent:
                 selection.append(random.choice(absent))
                 
+            # Store the random selection
+            ring_id = secrets.token_hex(8)
+            db["random_rings"][ring_id] = {
+                "students": selection,
+                "time": current_time_str()
+            }
+            
         return jsonify({
             "message": "Random selection complete",
-            "selected_students": selection
+            "selected_students": selection,
+            "ring_id": ring_id
         })
     
     except Exception as e:
@@ -179,6 +293,7 @@ def student_connect():
     try:
         student_id = request.json.get("student_id")
         bssid = request.json.get("bssid")
+        device_id = request.json.get("device_id", "")
         
         if not student_id:
             return jsonify({"error": "student_id is required"}), 400
@@ -195,7 +310,9 @@ def student_connect():
             
             student.update({
                 "connected": True,
-                "authorized": is_authorized
+                "authorized": is_authorized,
+                "last_seen": current_time_str(),
+                "device_id": device_id
             })
             
             if is_authorized and db["current_session"]:
@@ -239,6 +356,7 @@ def start_timer():
                 "status": "running"
             }
             student["attendance_status"] = "Pending"
+            student["last_seen"] = current_time_str()
             
         return jsonify({"message": "Timer started successfully"})
     
@@ -270,6 +388,7 @@ def mark_present():
                 "status": "completed"
             }
             student["leave_time"] = current_time_str()
+            student["last_seen"] = current_time_str()
             
             if db["current_session"] and student_id not in db["current_session"]["students_present"]:
                 db["current_session"]["students_present"].append(student_id)
@@ -294,7 +413,8 @@ def get_status():
                     "authorized": student["authorized"],
                     "attendance_status": student["attendance_status"],
                     "join_time": student["join_time"],
-                    "leave_time": student["leave_time"]
+                    "leave_time": student["leave_time"],
+                    "last_seen": student["last_seen"]
                 }
                 for sid, student in db["students"].items()
             }
@@ -319,6 +439,27 @@ def get_status():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/get_random_rings', methods=['GET'])
+def get_random_rings():
+    try:
+        student_id = request.args.get("student_id")
+        with lock:
+            active_rings = []
+            for ring_id, ring_data in db["random_rings"].items():
+                if student_id in ring_data["students"]:
+                    active_rings.append({
+                        "ring_id": ring_id,
+                        "time": ring_data["time"]
+                    })
+                    
+            return jsonify({
+                "ring_active": len(active_rings) > 0,
+                "last_ring": active_rings[0]["time"] if active_rings else None
+            })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # =========================
 # DEBUG/DEVELOPMENT ENDPOINTS
 # =========================
@@ -331,7 +472,8 @@ def reset():
                 "teachers": {},
                 "authorized_bssids": [],
                 "current_session": None,
-                "session_log": []
+                "session_log": [],
+                "random_rings": {}
             })
         return jsonify({"message": "System reset successfully"})
     
@@ -351,9 +493,14 @@ def add_sample_data():
                 db["students"][student_id] = initialize_student(student_id)
                 db["students"][student_id]["name"] = f"Student {i}"
                 
+            # Add a sample teacher
+            teacher_id = "teacher_1"
+            db["teachers"][teacher_id] = initialize_teacher(teacher_id, "Professor Smith", "password123")
+                
         return jsonify({
             "message": "Sample data added",
             "student_count": len(db["students"]),
+            "teacher_count": len(db["teachers"]),
             "bssids": db["authorized_bssids"]
         })
     
