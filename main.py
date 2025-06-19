@@ -1,6 +1,3 @@
-# app.py (merged version)
-from flask import Flask, request, jsonify, render_template
-from flask_cors import CORS
 import threading
 import time
 import random
@@ -8,13 +5,8 @@ from datetime import datetime
 import platform
 import subprocess
 import os
-import ctypes
-import calendar
-import re
 import json
-
-app = Flask(__name__)
-CORS(app)
+from collections import defaultdict
 
 # =========================
 # IN-MEMORY DATABASE
@@ -92,25 +84,14 @@ def update_timers():
 threading.Thread(target=update_timers, daemon=True).start()
 
 # =========================
-# ROUTES
+# TEACHER COMMANDS
 # =========================
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-# =========================
-# TEACHER ACTIONS
-# =========================
-@app.route('/set_bssid', methods=['POST'])
-def set_bssid():
-    bssids = request.json.get("bssids", [])
+def set_bssid(bssids):
     with lock:
         db["authorized_bssids"] = bssids
-    return jsonify({"message": "BSSIDs updated", "bssids": bssids})
+    print(f"BSSIDs updated to: {bssids}")
 
-@app.route('/start_session', methods=['POST'])
-def start_session():
-    session_name = request.json.get("session_name")
+def start_session(session_name):
     with lock:
         db["current_session"] = {
             "name": session_name,
@@ -121,9 +102,8 @@ def start_session():
             student["attendance_status"] = "Absent"
             student["join_time"] = None
             student["leave_time"] = None
-    return jsonify({"message": f"Session '{session_name}' started"})
+    print(f"Session '{session_name}' started")
 
-@app.route('/end_session', methods=['POST'])
 def end_session():
     with lock:
         session = db["current_session"]
@@ -131,11 +111,10 @@ def end_session():
             session["end_time"] = current_time_str()
             db["session_log"].append(session)
             db["current_session"] = None
-            return jsonify({"message": "Session ended"})
+            print("Session ended")
         else:
-            return jsonify({"error": "No active session"}), 400
+            print("Error: No active session")
 
-@app.route('/random_ring', methods=['POST'])
 def random_ring():
     with lock:
         students = list(db["students"].items())
@@ -147,37 +126,19 @@ def random_ring():
         if absent:
             selection.append(random.choice(absent))
         
-        # Store the selection with timestamp
         db["random_rings"]["last_ring"] = datetime.now().isoformat()
         db["random_rings"]["selected_students"] = selection
         db["random_rings"]["ring_active"] = True
         
-    return jsonify({"selected_students": selection})
-
-@app.route('/get_random_rings', methods=['GET'])
-def get_random_rings():
-    student_id = request.args.get("student_id")
-    with lock:
-        rings = db["random_rings"].copy()
-        
-        # Check if this student was selected
-        if student_id and rings.get("selected_students"):
-            rings["student_selected"] = student_id in rings["selected_students"]
-        else:
-            rings["student_selected"] = False
-            
-    return jsonify(rings)
+    print(f"Randomly selected students: {selection}")
 
 # =========================
-# STUDENT ACTIONS
+# STUDENT COMMANDS
 # =========================
-@app.route('/student/connect', methods=['POST'])
-def student_connect():
-    student_id = request.json.get("student_id")
-    bssid = request.json.get("bssid")
-
+def student_connect(student_id, bssid):
     if not student_id or not bssid:
-        return jsonify({"error": "student_id and bssid required"}), 400
+        print("Error: student_id and bssid required")
+        return
 
     with lock:
         student = db["students"].setdefault(student_id, {
@@ -210,20 +171,17 @@ def student_connect():
             student["attendance_status"] = "Pending"
             student["join_time"] = current_time_str()
 
-        return jsonify({
-            "authorized": is_authorized,
-            "attendance_status": student["attendance_status"]
-        })
+        print(f"Student {student_id} connected. Authorized: {is_authorized}")
 
-@app.route('/student/timer/start', methods=['POST'])
-def start_timer():
-    student_id = request.json.get("student_id")
+def start_timer(student_id):
     with lock:
         student = db["students"].get(student_id)
         if not student:
-            return jsonify({"error": "Student not found"}), 404
+            print("Error: Student not found")
+            return
         if not student["authorized"]:
-            return jsonify({"error": "Not authorized"}), 403
+            print("Error: Not authorized")
+            return
 
         student["timer"] = {
             "duration": 120,
@@ -233,11 +191,9 @@ def start_timer():
             "status": "running"
         }
         student["attendance_status"] = "Pending"
-    return jsonify({"message": "Timer started"})
+    print(f"Timer started for student {student_id}")
 
-@app.route('/mark_present', methods=['POST'])
-def mark_present():
-    student_id = request.json.get("student_id")
+def mark_present(student_id):
     with lock:
         student = db["students"].get(student_id)
         if student:
@@ -246,18 +202,11 @@ def mark_present():
             student["timer"]["running"] = False
             student["timer"]["remaining"] = 0
             student["leave_time"] = current_time_str()
-            return jsonify({"message": "Marked present"})
-        return jsonify({"error": "Student not found"}), 404
+            print(f"Marked student {student_id} as present")
+        else:
+            print("Error: Student not found")
 
-@app.route('/update_wifi_status', methods=['POST'])
-def update_wifi_status():
-    data = request.json
-    student_id = data.get("username")
-    status = data.get("status")
-    bssid = data.get("bssid")
-    ssid = data.get("ssid")
-    device = data.get("device")
-
+def update_wifi_status(student_id, status, bssid=None, ssid=None, device=None):
     with lock:
         student = db["students"].get(student_id)
         if student:
@@ -265,80 +214,135 @@ def update_wifi_status():
             student["bssid"] = bssid
             student["ssid"] = ssid
             student["device_id"] = device
-            student["authorized"] = bssid in db["authorized_bssids"]
+            student["authorized"] = bssid in db["authorized_bssids"] if bssid else False
             student["connected"] = status == "connected"
-            
-    return jsonify({"message": "WiFi status updated"})
+            print(f"Updated WiFi status for {student_id}: {status}")
+        else:
+            print(f"Error: Student {student_id} not found")
 
 # =========================
-# STATUS FOR FRONTEND
+# STATUS COMMANDS
 # =========================
-@app.route('/get_status', methods=['GET'])
 def get_status():
     with lock:
-        students_status = {}
+        print("\n=== CURRENT STATUS ===")
+        print(f"Authorized BSSIDs: {db['authorized_bssids']}")
+        
+        if db["current_session"]:
+            print(f"\nActive Session: {db['current_session']['name']} (started at {db['current_session']['start_time']})")
+        else:
+            print("\nNo active session")
+            
+        print("\nStudents:")
         for sid, student in db["students"].items():
             timer = student.get("timer", {})
-            attendance = student.get("attendance_status", "Unknown")
-            students_status[sid] = {
-                "name": student["name"],
-                "timer": timer,
-                "connected": student["connected"],
-                "authorized": student["authorized"],
-                "attendance_status": attendance,
-                "join_time": student.get("join_time"),
-                "leave_time": student.get("leave_time"),
-                "wifi_status": student.get("wifi_status", "unknown"),
-                "bssid": student.get("bssid"),
-                "ssid": student.get("ssid"),
-                "device_id": student.get("device_id")
-            }
+            print(f"{sid}: {student['name']}")
+            print(f"  Status: {student['attendance_status']}")
+            print(f"  Connected: {student['connected']} (Authorized: {student['authorized']})")
+            print(f"  Timer: {timer.get('status', 'stopped')} ({timer.get('remaining', 0)}s remaining)")
+            print(f"  WiFi: {student.get('wifi_status', 'unknown')} (BSSID: {student.get('bssid')})")
+            
+        if db["random_rings"].get("ring_active"):
+            print(f"\nRandom Ring active (selected at {db['random_rings']['last_ring']}):")
+            print(f"Selected students: {db['random_rings']['selected_students']}")
 
-        return jsonify({
-            "authorized_bssids": db["authorized_bssids"],
-            "students": students_status,
-            "current_session": db["current_session"],
-            "random_rings": db["random_rings"]
-        })
-
-@app.route('/get_authorized_bssids', methods=['GET'])
-def get_authorized_bssids():
+def get_attendance_report():
     with lock:
-        return jsonify({"bssids": db["authorized_bssids"]})
-
-@app.route('/get_attendance_session', methods=['GET'])
-def get_attendance_session():
-    with lock:
-        return jsonify({
-            "active": db["current_session"] is not None,
-            "session": db["current_session"]
-        })
+        if not db["session_log"]:
+            print("No attendance sessions recorded yet")
+            return
+            
+        print("\n=== ATTENDANCE HISTORY ===")
+        for i, session in enumerate(db["session_log"], 1):
+            print(f"\nSession {i}: {session['name']}")
+            print(f"  From {session['start_time']} to {session['end_time']}")
+            
+            # Count attendance statuses
+            status_count = defaultdict(int)
+            for student in db["students"].values():
+                status_count[student.get("attendance_status", "Unknown")] += 1
+                
+            for status, count in status_count.items():
+                print(f"  {status}: {count}")
 
 # =========================
-# AUTHENTICATION
+# COMMAND PROCESSOR
 # =========================
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.json
-    username = data.get("username")
-    password = data.get("password")  # In a real app, use proper password hashing
+def process_command(command):
+    parts = command.strip().split()
+    if not parts:
+        return
     
-    # This is a simplified version - in production, use proper authentication
-    if username.startswith("teacher"):
-        return jsonify({
-            "message": "Login successful",
-            "type": "teacher"
-        })
-    elif username.startswith("student"):
-        return jsonify({
-            "message": "Login successful",
-            "type": "student"
-        })
-    else:
-        return jsonify({"error": "Invalid credentials"}), 401
+    cmd = parts[0].lower()
+    
+    try:
+        if cmd == "set_bssid" and len(parts) > 1:
+            set_bssid(parts[1:])
+        elif cmd == "start_session" and len(parts) > 1:
+            start_session(" ".join(parts[1:]))
+        elif cmd == "end_session":
+            end_session()
+        elif cmd == "random_ring":
+            random_ring()
+        elif cmd == "connect" and len(parts) > 2:
+            student_connect(parts[1], parts[2])
+        elif cmd == "start_timer" and len(parts) > 1:
+            start_timer(parts[1])
+        elif cmd == "mark_present" and len(parts) > 1:
+            mark_present(parts[1])
+        elif cmd == "wifi_status" and len(parts) > 2:
+            update_wifi_status(parts[1], parts[2], 
+                             bssid=parts[3] if len(parts) > 3 else None,
+                             ssid=parts[4] if len(parts) > 4 else None,
+                             device=parts[5] if len(parts) > 5 else None)
+        elif cmd == "status":
+            get_status()
+        elif cmd == "attendance":
+            get_attendance_report()
+        elif cmd == "help":
+            print_help()
+        elif cmd == "exit":
+            return False
+        else:
+            print("Unknown command. Type 'help' for available commands.")
+    except Exception as e:
+        print(f"Error executing command: {e}")
+    
+    return True
+
+def print_help():
+    print("\nAvailable commands:")
+    print("  set_bssid <bssid1> [bssid2...] - Set authorized BSSIDs")
+    print("  start_session <name> - Start a new attendance session")
+    print("  end_session - End the current session")
+    print("  random_ring - Randomly select students")
+    print("  connect <student_id> <bssid> - Connect a student")
+    print("  start_timer <student_id> - Start attendance timer for student")
+    print("  mark_present <student_id> - Manually mark student present")
+    print("  wifi_status <student_id> <status> [bssid] [ssid] [device] - Update WiFi status")
+    print("  status - Show current system status")
+    print("  attendance - Show attendance history")
+    print("  help - Show this help")
+    print("  exit - Exit the program")
 
 # =========================
-# START APP
+# MAIN LOOP
 # =========================
+def main():
+    print("Attendance System Console")
+    print("Type 'help' for available commands")
+    
+    running = True
+    while running:
+        try:
+            command = input("\n> ")
+            running = process_command(command)
+        except KeyboardInterrupt:
+            print("\nUse 'exit' to quit the program")
+        except EOFError:
+            running = False
+    
+    print("Shutting down...")
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    main()
