@@ -1,338 +1,344 @@
-# -*- coding: utf-8 -*-
-#
-# server.py
-# The backend server for the Let's Bunk Attendance Management System.
-#
-# This server uses Flask to provide a REST API for the PyQt6 client. It manages
-# all application state in memory, including users, sessions, and attendance timers.
-# A background thread is used to handle real-time timer countdowns.
-#
-import time
-import threading
-import logging
-import random
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+# app.py (merged version)
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
+import threading
+import time
+import random
+from datetime import datetime
+import platform
+import subprocess
+import os
+import ctypes
+import calendar
+import re
+import json
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-# The duration in seconds a student must be connected to mark attendance.
-ATTENDANCE_TIMER_DURATION = 120  # 2 minutes
-# The number of students to select for a "random ring".
-RANDOM_RING_COUNT = 2
-
-# Set up basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Initialize Flask App
 app = Flask(__name__)
-# Enable CORS for all routes, allowing the client to connect from any origin.
 CORS(app)
 
-# =============================================================================
-# IN-MEMORY "DATABASE" AND STATE MANAGEMENT
-# =============================================================================
-# In a production environment, this data would be stored in a persistent database
-# like PostgreSQL or SQLite. For this example, we use global dictionaries.
-
-# --- Thread-Safety Lock ---
-# This lock is crucial to prevent race conditions when multiple requests or
-# the background timer thread access shared data simultaneously.
-data_lock = threading.Lock()
-
-# --- Persistent Data (Simulating a DB) ---
-# NOTE: The client's login/signup is currently a placeholder. This server doesn't
-# perform real authentication, but the structure is here.
-teachers_db = {
-    "teacher1": {"name": "Prof. Alan Turing", "password": "password123"},
+# =========================
+# IN-MEMORY DATABASE
+# =========================
+db = {
+    "students": {},  # student_id: {details}
+    "teachers": {},  # teacher_id: {details}
+    "authorized_bssids": ["ee:ee:6d:9d:6f:ba"],
+    "current_session": None,
+    "session_log": [],
+    "timetable": {},
+    "holidays": {
+        "national_holidays": {},
+        "custom_holidays": {}
+    },
+    "random_rings": {}
 }
-students_db = {
-    "S001": {"name": "Ada Lovelace"},
-    "S002": {"name": "Grace Hopper"},
-    "S003": {"name": "Charles Babbage"},
-    "S004": {"name": "John von Neumann"},
-}
-authorized_bssids = [
-    "c0:3e:ba:d1:9b:f1", # Example BSSID, change to your own for testing
-]
 
-# --- Session State (Resets when a new session starts) ---
-# This dictionary holds the active state of the current attendance session.
-# It is set to None when no session is active.
-current_session = None
+lock = threading.Lock()
 
-# This dictionary holds the dynamic data for each student within the active session.
-# It is keyed by student_id.
-students_session_data = {}
+# =========================
+# UTILITIES
+# =========================
+def get_attendance_status(timer_status):
+    return {
+        "stopped": "Absent",
+        "running": "Pending",
+        "paused": "On Bunk",
+        "completed": "Attended"
+    }.get(timer_status, "Unknown")
 
+def current_time_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def format_time(dt_obj):
-    """Helper function to format datetime objects into a consistent string."""
-    if not dt_obj:
-        return None
-    return dt_obj.strftime("%H:%M:%S")
+def get_device_id():
+    """Generate a unique device ID for this student"""
+    if os.name == 'nt':
+        # Windows - use volume serial number
+        try:
+            output = subprocess.check_output("wmic csproduct get uuid", shell=True)
+            return output.decode().split('\n')[1].strip()
+        except:
+            return "unknown_device"
+    else:
+        # Linux/Mac - use machine-id
+        try:
+            with open('/etc/machine-id') as f:
+                return f.read().strip()
+        except:
+            return "unknown_device"
 
-def reset_session_data():
-    """
-    Resets all session-related state. Called when a new session is started
-    to ensure a clean slate.
-    """
-    global current_session, students_session_data
-    current_session = None
-    students_session_data.clear()
-    logging.info("Session data has been reset.")
+# =========================
+# BACKGROUND TIMER THREAD
+# =========================
+def update_timers():
+    while True:
+        with lock:
+            for student_id, student in db["students"].items():
+                timer = student.get("timer", {})
+                if timer.get("running"):
+                    now = time.time()
+                    elapsed = now - timer["last_update"]
+                    timer["remaining"] -= elapsed
+                    timer["last_update"] = now
+                    if timer["remaining"] <= 0:
+                        timer.update({
+                            "remaining": 0,
+                            "running": False,
+                            "status": "completed"
+                        })
+                        student["attendance_status"] = "Attended"
+                        student["leave_time"] = current_time_str()
+        time.sleep(1)
 
+threading.Thread(target=update_timers, daemon=True).start()
 
-class TimerManager(threading.Thread):
-    """
-    A background thread that manages all student attendance timers.
-    It runs every second to decrement the timers of 'running' students.
-    """
-    def __init__(self):
-        super().__init__(daemon=True)
-        self.stop_event = threading.Event()
+# =========================
+# ROUTES
+# =========================
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-    def stop(self):
-        self.stop_event.set()
-
-    def run(self):
-        logging.info("TimerManager thread started.")
-        while not self.stop_event.is_set():
-            with data_lock:
-                # The timer only runs if there's an active session
-                if current_session:
-                    for sid, data in students_session_data.items():
-                        timer = data.get("timer", {})
-                        if timer.get("status") == "running":
-                            # Calculate elapsed time since the timer was last started/resumed
-                            now = time.time()
-                            elapsed_since_start = now - timer.get("start_time_unix", now)
-
-                            # The new remaining time is the old remaining time minus the new elapsed chunk
-                            new_remaining = timer.get("initial_remaining", 0) - elapsed_since_start
-
-                            if new_remaining <= 0:
-                                timer["remaining"] = 0
-                                timer["status"] = "completed"
-                                data["attendance_status"] = "Attended"
-                                logging.info(f"Student {sid} completed attendance timer.")
-                            else:
-                                timer["remaining"] = new_remaining
-
-            # Sleep for one second before the next update cycle
-            time.sleep(1)
-        logging.info("TimerManager thread stopped.")
-
-
-# =============================================================================
-# API ENDPOINTS
-# =============================================================================
-
-@app.route('/get_status', methods=['GET'])
-def get_status():
-    """
-    The primary endpoint for the client to fetch the entire application state.
-    It combines static student info with dynamic session data.
-    """
-    with data_lock:
-        # Create a deep copy to send, preventing modification of the original data.
-        full_student_status = {}
-        for sid, student_info in students_db.items():
-            session_info = students_session_data.get(sid, {})
-            # Merge static info (name) with dynamic session info
-            full_student_status[sid] = {**student_info, **session_info}
-
-        response = {
-            "current_session": current_session,
-            "students": full_student_status,
-            "authorized_bssids": authorized_bssids
-        }
-        return jsonify(response)
+# =========================
+# TEACHER ACTIONS
+# =========================
+@app.route('/set_bssid', methods=['POST'])
+def set_bssid():
+    bssids = request.json.get("bssids", [])
+    with lock:
+        db["authorized_bssids"] = bssids
+    return jsonify({"message": "BSSIDs updated", "bssids": bssids})
 
 @app.route('/start_session', methods=['POST'])
 def start_session():
-    """
-    Endpoint for a teacher to start a new attendance session.
-    This clears all previous session data and initializes a new one.
-    """
-    with data_lock:
-        reset_session_data()  # Clear any old data first
-
-        global current_session
-        data = request.json
-        now = datetime.now()
-        current_session = {
-            "name": data.get("session_name", "Unnamed Session"),
-            "start_time": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "status": "active"
+    session_name = request.json.get("session_name")
+    with lock:
+        db["current_session"] = {
+            "name": session_name,
+            "start_time": current_time_str(),
+            "students_present": []
         }
-
-        # Initialize session data for all registered students
-        for sid, student_info in students_db.items():
-            students_session_data[sid] = {
-                "attendance_status": "Absent",
-                "join_time": None,
-                "leave_time": None,
-                "is_connected_authorized": False,
-                "timer": {
-                    "status": "stopped",  # can be 'stopped', 'running', 'paused', 'completed'
-                    "remaining": ATTENDANCE_TIMER_DURATION,
-                    "start_time_unix": 0,
-                    "initial_remaining": ATTENDANCE_TIMER_DURATION, # Tracks time left before a pause
-                }
-            }
-        logging.info(f"New session started: {current_session['name']}")
-    return jsonify({"status": "success", "message": "Session started."})
+        for student in db["students"].values():
+            student["attendance_status"] = "Absent"
+            student["join_time"] = None
+            student["leave_time"] = None
+    return jsonify({"message": f"Session '{session_name}' started"})
 
 @app.route('/end_session', methods=['POST'])
 def end_session():
-    """
-    Endpoint for a teacher to end the current session.
-    """
-    with data_lock:
-        if not current_session:
-            return jsonify({"status": "error", "message": "No active session to end."}), 400
-
-        # Effectively stops all timers and finalizes the state.
-        reset_session_data()
-        logging.info("Session ended by teacher.")
-    return jsonify({"status": "success", "message": "Session ended."})
-
-@app.route('/set_bssid', methods=['POST'])
-def set_bssid():
-    """
-    Endpoint for a teacher to update the list of authorized BSSIDs.
-    """
-    with data_lock:
-        global authorized_bssids
-        data = request.json
-        new_bssids = data.get("bssids", [])
-        if isinstance(new_bssids, list):
-            authorized_bssids = [b.strip().lower() for b in new_bssids]
-            logging.info(f"Authorized BSSIDs updated: {authorized_bssids}")
-            return jsonify({"status": "success", "message": "BSSID list updated."})
-        return jsonify({"status": "error", "message": "Invalid data format."}), 400
-
-@app.route('/student/connect', methods=['POST'])
-def student_connect():
-    """
-    Called by the student client's WifiChecker. Updates the student's
-    connection status and pauses/resumes their timer accordingly.
-    """
-    with data_lock:
-        if not current_session:
-            return jsonify({"status": "ignored", "message": "No active session."})
-
-        data = request.json
-        student_id = data.get("student_id")
-        bssid = data.get("bssid")
-
-        student_data = students_session_data.get(student_id)
-        if not student_data:
-            return jsonify({"status": "error", "message": "Student not found in session."}), 404
-
-        now = datetime.now()
-        is_authorized = bssid in authorized_bssids if bssid else False
-        student_data["is_connected_authorized"] = is_authorized
-
-        timer = student_data["timer"]
-
-        if is_authorized:
-            student_data["join_time"] = format_time(now)
-            student_data["leave_time"] = None
-            # If the timer was paused, resume it
-            if timer["status"] == "paused":
-                timer["status"] = "running"
-                timer["start_time_unix"] = time.time() # Reset start time for the current running chunk
-                timer["initial_remaining"] = timer["remaining"] # The new "full" duration is what was left
-                logging.info(f"Student {student_id} reconnected to authorized WiFi. Timer resumed.")
+    with lock:
+        session = db["current_session"]
+        if session:
+            session["end_time"] = current_time_str()
+            db["session_log"].append(session)
+            db["current_session"] = None
+            return jsonify({"message": "Session ended"})
         else:
-            student_data["leave_time"] = format_time(now)
-            # If the timer was running, pause it
-            if timer["status"] == "running":
-                timer["status"] = "paused"
-                # The remaining time is already calculated by the background thread,
-                # so we just need to stop it from decrementing further.
-                logging.info(f"Student {student_id} disconnected from authorized WiFi. Timer paused.")
-
-    return jsonify({"status": "success", "message": "Connection status updated."})
-
-@app.route('/student/timer/start', methods=['POST'])
-def start_student_timer():
-    """
-    Called when a student clicks the "Mark My Attendance" button.
-    Starts their timer if they are connected to an authorized network.
-    """
-    with data_lock:
-        if not current_session:
-            return jsonify({"status": "error", "message": "No active session."}), 400
-
-        data = request.json
-        student_id = data.get("student_id")
-
-        student_data = students_session_data.get(student_id)
-        if not student_data:
-            return jsonify({"status": "error", "message": "Student not found."}), 404
-
-        if not student_data.get("is_connected_authorized"):
-            return jsonify({"status": "error", "message": "Must be connected to an authorized WiFi network."}), 403
-
-        timer = student_data["timer"]
-        if timer["status"] in ["running", "completed"]:
-            return jsonify({"status": "ignored", "message": "Timer is already running or completed."})
-
-        timer["status"] = "running"
-        timer["start_time_unix"] = time.time()
-        timer["initial_remaining"] = timer["remaining"]
-        logging.info(f"Student {student_id} started their attendance timer.")
-
-    return jsonify({"status": "success", "message": "Timer started."})
-
+            return jsonify({"error": "No active session"}), 400
 
 @app.route('/random_ring', methods=['POST'])
 def random_ring():
-    """
-    Selects a few students who have already marked attendance and
-    sets their status to "On Bunk", requiring them to be physically present.
-    """
-    with data_lock:
-        if not current_session:
-            return jsonify({"status": "error", "message": "No active session."}), 400
+    with lock:
+        students = list(db["students"].items())
+        attended = [sid for sid, s in students if s.get("attendance_status") == "Attended"]
+        absent = [sid for sid, s in students if s.get("attendance_status") == "Absent"]
+        selection = []
+        if attended:
+            selection.append(random.choice(attended))
+        if absent:
+            selection.append(random.choice(absent))
+        
+        # Store the selection with timestamp
+        db["random_rings"]["last_ring"] = datetime.now().isoformat()
+        db["random_rings"]["selected_students"] = selection
+        db["random_rings"]["ring_active"] = True
+        
+    return jsonify({"selected_students": selection})
 
-        # Find students eligible for the random ring (i.e., status is Attended)
-        eligible_students = [
-            sid for sid, data in students_session_data.items()
-            if data["attendance_status"] == "Attended"
-        ]
+@app.route('/get_random_rings', methods=['GET'])
+def get_random_rings():
+    student_id = request.args.get("student_id")
+    with lock:
+        rings = db["random_rings"].copy()
+        
+        # Check if this student was selected
+        if student_id and rings.get("selected_students"):
+            rings["student_selected"] = student_id in rings["selected_students"]
+        else:
+            rings["student_selected"] = False
+            
+    return jsonify(rings)
 
-        # Determine how many students to select
-        count = min(RANDOM_RING_COUNT, len(eligible_students))
-        if count == 0:
-            return jsonify({"status": "success", "message": "No attended students to select.", "selected_students": []})
+# =========================
+# STUDENT ACTIONS
+# =========================
+@app.route('/student/connect', methods=['POST'])
+def student_connect():
+    student_id = request.json.get("student_id")
+    bssid = request.json.get("bssid")
 
-        # Randomly select students
-        selected_students = random.sample(eligible_students, count)
+    if not student_id or not bssid:
+        return jsonify({"error": "student_id and bssid required"}), 400
 
-        # Update the status of selected students
-        for sid in selected_students:
-            students_session_data[sid]["attendance_status"] = "On Bunk"
+    with lock:
+        student = db["students"].setdefault(student_id, {
+            "name": f"Student {student_id}",
+            "timer": {
+                "duration": 120,
+                "remaining": 0,
+                "running": False,
+                "last_update": None,
+                "status": "stopped"
+            },
+            "connected": False,
+            "authorized": False,
+            "attendance_status": "Absent",
+            "join_time": None,
+            "leave_time": None,
+            "wifi_status": "disconnected",
+            "bssid": None,
+            "ssid": None,
+            "device_id": get_device_id()
+        })
 
-        logging.info(f"Random ring initiated. Selected students: {selected_students}")
-        return jsonify({"status": "success", "selected_students": selected_students})
+        is_authorized = bssid in db["authorized_bssids"]
+        student["connected"] = True
+        student["authorized"] = is_authorized
+        student["bssid"] = bssid
+        student["wifi_status"] = "connected"
 
-# =============================================================================
-# APPLICATION ENTRY POINT
-# =============================================================================
+        if is_authorized:
+            student["attendance_status"] = "Pending"
+            student["join_time"] = current_time_str()
 
+        return jsonify({
+            "authorized": is_authorized,
+            "attendance_status": student["attendance_status"]
+        })
+
+@app.route('/student/timer/start', methods=['POST'])
+def start_timer():
+    student_id = request.json.get("student_id")
+    with lock:
+        student = db["students"].get(student_id)
+        if not student:
+            return jsonify({"error": "Student not found"}), 404
+        if not student["authorized"]:
+            return jsonify({"error": "Not authorized"}), 403
+
+        student["timer"] = {
+            "duration": 120,
+            "remaining": 120,
+            "running": True,
+            "last_update": time.time(),
+            "status": "running"
+        }
+        student["attendance_status"] = "Pending"
+    return jsonify({"message": "Timer started"})
+
+@app.route('/mark_present', methods=['POST'])
+def mark_present():
+    student_id = request.json.get("student_id")
+    with lock:
+        student = db["students"].get(student_id)
+        if student:
+            student["attendance_status"] = "Attended"
+            student["timer"]["status"] = "completed"
+            student["timer"]["running"] = False
+            student["timer"]["remaining"] = 0
+            student["leave_time"] = current_time_str()
+            return jsonify({"message": "Marked present"})
+        return jsonify({"error": "Student not found"}), 404
+
+@app.route('/update_wifi_status', methods=['POST'])
+def update_wifi_status():
+    data = request.json
+    student_id = data.get("username")
+    status = data.get("status")
+    bssid = data.get("bssid")
+    ssid = data.get("ssid")
+    device = data.get("device")
+
+    with lock:
+        student = db["students"].get(student_id)
+        if student:
+            student["wifi_status"] = status
+            student["bssid"] = bssid
+            student["ssid"] = ssid
+            student["device_id"] = device
+            student["authorized"] = bssid in db["authorized_bssids"]
+            student["connected"] = status == "connected"
+            
+    return jsonify({"message": "WiFi status updated"})
+
+# =========================
+# STATUS FOR FRONTEND
+# =========================
+@app.route('/get_status', methods=['GET'])
+def get_status():
+    with lock:
+        students_status = {}
+        for sid, student in db["students"].items():
+            timer = student.get("timer", {})
+            attendance = student.get("attendance_status", "Unknown")
+            students_status[sid] = {
+                "name": student["name"],
+                "timer": timer,
+                "connected": student["connected"],
+                "authorized": student["authorized"],
+                "attendance_status": attendance,
+                "join_time": student.get("join_time"),
+                "leave_time": student.get("leave_time"),
+                "wifi_status": student.get("wifi_status", "unknown"),
+                "bssid": student.get("bssid"),
+                "ssid": student.get("ssid"),
+                "device_id": student.get("device_id")
+            }
+
+        return jsonify({
+            "authorized_bssids": db["authorized_bssids"],
+            "students": students_status,
+            "current_session": db["current_session"],
+            "random_rings": db["random_rings"]
+        })
+
+@app.route('/get_authorized_bssids', methods=['GET'])
+def get_authorized_bssids():
+    with lock:
+        return jsonify({"bssids": db["authorized_bssids"]})
+
+@app.route('/get_attendance_session', methods=['GET'])
+def get_attendance_session():
+    with lock:
+        return jsonify({
+            "active": db["current_session"] is not None,
+            "session": db["current_session"]
+        })
+
+# =========================
+# AUTHENTICATION
+# =========================
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")  # In a real app, use proper password hashing
+    
+    # This is a simplified version - in production, use proper authentication
+    if username.startswith("teacher"):
+        return jsonify({
+            "message": "Login successful",
+            "type": "teacher"
+        })
+    elif username.startswith("student"):
+        return jsonify({
+            "message": "Login successful",
+            "type": "student"
+        })
+    else:
+        return jsonify({"error": "Invalid credentials"}), 401
+
+# =========================
+# START APP
+# =========================
 if __name__ == '__main__':
-    # Initialize and start the background timer manager thread
-    timer_thread = TimerManager()
-    timer_thread.start()
-
-    logging.info("Starting Flask server...")
-    # Run the Flask app.
-    # host='0.0.0.0' makes the server accessible from other devices on the same network.
-    # debug=True provides helpful error pages but should be False in production.
-    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+    app.run(host='0.0.0.0', port=5000, debug=True)
