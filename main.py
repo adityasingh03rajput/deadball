@@ -4,8 +4,7 @@ from datetime import datetime, timedelta
 import threading
 import time
 import random
-import json
-import os
+from werkzeug.security import generate_password_hash, check_password_hash
 import uuid
 
 app = Flask(__name__)
@@ -13,8 +12,40 @@ CORS(app)
 
 class AttendanceServer:
     def __init__(self):
-        self.teachers = {}
-        self.students = {}
+        self.teachers = {
+            "admin": {
+                'id': "admin",
+                'password': generate_password_hash("admin"),
+                'email': "admin@school.com",
+                'name': "Admin",
+                'classrooms': ["A101", "A102", "B201", "B202"],
+                'bssid_mapping': {"A101": "00:11:22:33:44:55", "A102": "AA:BB:CC:DD:EE:FF"},
+                'branches': ["CSE", "ECE", "EEE", "ME", "CE"],
+                'semesters': list(range(1, 9))
+            }
+        }
+        
+        self.students = {
+            "s001": {
+                'id': "s001",
+                'password': generate_password_hash("student123"),
+                'name': "John Doe",
+                'classroom': "A101",
+                'branch': "CSE",
+                'semester': 3,
+                'attendance': {}
+            },
+            "s002": {
+                'id': "s002",
+                'password': generate_password_hash("student123"),
+                'name': "Jane Smith",
+                'classroom': "A101",
+                'branch': "CSE",
+                'semester': 3,
+                'attendance': {}
+            }
+        }
+        
         self.sessions = {}
         self.student_checkins = {}
         self.student_timers = {}
@@ -22,8 +53,13 @@ class AttendanceServer:
         self.active_devices = {}
         self.authorized_bssid = None
         self.holidays = []
-        self.special_schedules = []
-        self.timetables = {}
+        self.special_dates = []
+        self.timetables = {
+            "CSE_3": [
+                ["Monday", "09:00", "10:00", "Mathematics", "A101"],
+                ["Monday", "10:00", "11:00", "Physics", "A101"]
+            ]
+        }
         self.lock = threading.Lock()
         
         # Configuration
@@ -31,68 +67,8 @@ class AttendanceServer:
         self.TIMER_DURATION = 300  # 5 minutes in seconds
         self.SERVER_PORT = 5000
         
-        # Load initial data
-        self.load_initial_data()
-        
         # Start background threads
         self.start_background_threads()
-    
-    def load_initial_data(self):
-        """Load initial data from files if they exist"""
-        if not os.path.exists('data'):
-            os.makedirs('data')
-        
-        # Load teachers
-        if os.path.exists('data/teachers.json'):
-            try:
-                with open('data/teachers.json', 'r') as f:
-                    self.teachers = json.load(f)
-            except:
-                self.teachers = {}
-        
-        # Load students
-        if os.path.exists('data/students.json'):
-            try:
-                with open('data/students.json', 'r') as f:
-                    self.students = json.load(f)
-            except:
-                self.students = {}
-        
-        # Load holidays and special dates
-        if os.path.exists('data/special_dates.json'):
-            try:
-                with open('data/special_dates.json', 'r') as f:
-                    special_data = json.load(f)
-                    self.holidays = special_data.get('holidays', [])
-                    self.special_schedules = special_data.get('special_schedules', [])
-            except:
-                self.holidays = []
-                self.special_schedules = []
-        
-        # Load timetables
-        if os.path.exists('data/timetables.json'):
-            try:
-                with open('data/timetables.json', 'r') as f:
-                    self.timetables = json.load(f)
-            except:
-                self.timetables = {}
-    
-    def save_data(self):
-        """Save all data to files"""
-        with open('data/teachers.json', 'w') as f:
-            json.dump(self.teachers, f)
-        
-        with open('data/students.json', 'w') as f:
-            json.dump(self.students, f)
-        
-        with open('data/special_dates.json', 'w') as f:
-            json.dump({
-                'holidays': self.holidays,
-                'special_schedules': self.special_schedules
-            }, f)
-        
-        with open('data/timetables.json', 'w') as f:
-            json.dump(self.timetables, f)
     
     def start_background_threads(self):
         """Start all background maintenance threads"""
@@ -104,16 +80,6 @@ class AttendanceServer:
         
         device_cleanup_thread = threading.Thread(target=self.cleanup_active_devices, daemon=True)
         device_cleanup_thread.start()
-        
-        save_thread = threading.Thread(target=self.periodic_save, daemon=True)
-        save_thread.start()
-    
-    def periodic_save(self):
-        """Periodically save data to disk"""
-        while True:
-            time.sleep(300)  # Save every 5 minutes
-            with self.lock:
-                self.save_data()
     
     def update_timers(self):
         """Background thread to update all student timers"""
@@ -231,7 +197,7 @@ def teacher_signup():
         
         server.teachers[teacher_id] = {
             'id': teacher_id,
-            'password': password,  # No hashing for simplicity
+            'password': generate_password_hash(password),
             'email': email,
             'name': name,
             'classrooms': [],
@@ -255,7 +221,7 @@ def teacher_login():
     if not teacher:
         return jsonify({'error': 'Teacher not found'}), 404
     
-    if teacher['password'] != password:
+    if not check_password_hash(teacher['password'], password):
         return jsonify({'error': 'Incorrect password'}), 401
     
     return jsonify({
@@ -282,7 +248,7 @@ def register_student():
         
         server.students[student_id] = {
             'id': student_id,
-            'password': password,  # No hashing for simplicity
+            'password': generate_password_hash(password),
             'name': name,
             'classroom': classroom,
             'branch': branch,
@@ -385,10 +351,10 @@ def change_teacher_password():
         if teacher_id not in server.teachers:
             return jsonify({'error': 'Teacher not found'}), 404
         
-        if server.teachers[teacher_id]['password'] != old_password:
+        if not check_password_hash(server.teachers[teacher_id]['password'], old_password):
             return jsonify({'error': 'Incorrect current password'}), 401
         
-        server.teachers[teacher_id]['password'] = new_password
+        server.teachers[teacher_id]['password'] = generate_password_hash(new_password)
         return jsonify({'message': 'Password changed successfully'}), 200
 
 @app.route('/teacher/update_bssid', methods=['POST'])
@@ -640,18 +606,18 @@ def random_ring():
 def get_special_dates():
     return jsonify({
         'holidays': server.holidays,
-        'special_schedules': server.special_schedules
+        'special_dates': server.special_dates
     }), 200
 
 @app.route('/teacher/update_special_dates', methods=['POST'])
 def update_special_dates():
     data = request.json
     holidays = data.get('holidays', [])
-    special_schedules = data.get('special_schedules', [])
+    special_dates = data.get('special_dates', [])
     
     with server.lock:
         server.holidays = holidays
-        server.special_schedules = special_schedules
+        server.special_dates = special_dates
     
     return jsonify({'message': 'Special dates updated successfully'}), 200
 
@@ -699,7 +665,7 @@ def student_login():
         if student_id not in server.students:
             return jsonify({'error': 'Student not found'}), 404
         
-        if server.students[student_id]['password'] != password:
+        if not check_password_hash(server.students[student_id]['password'], password):
             return jsonify({'error': 'Incorrect password'}), 401
         
         if student_id in server.active_devices and server.active_devices[student_id]['device_id'] != device_id:
@@ -944,13 +910,6 @@ def student_get_timetable():
         return jsonify({
             'timetable': timetable
         }), 200
-
-@app.route('/student/get_special_dates', methods=['GET'])
-def student_get_special_dates():
-    return jsonify({
-        'holidays': server.holidays,
-        'special_schedules': server.special_schedules
-    }), 200
 
 @app.route('/student/ping', methods=['POST'])
 def student_ping():
