@@ -6,9 +6,19 @@ import time
 import random
 from werkzeug.security import generate_password_hash, check_password_hash
 import uuid
+import logging
+from logging.handlers import RotatingFileHandler
 
 app = Flask(__name__)
 CORS(app)
+
+# Configure logging
+handler = RotatingFileHandler('attendance_server.log', maxBytes=1000000, backupCount=5)
+handler.setFormatter(logging.Formatter(
+    '[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
+))
+app.logger.addHandler(handler)
+app.logger.setLevel(logging.INFO)
 
 class AttendanceServer:
     def __init__(self):
@@ -66,9 +76,12 @@ class AttendanceServer:
         self.CHECKIN_INTERVAL = 5  # seconds
         self.TIMER_DURATION = 300  # 5 minutes in seconds
         self.SERVER_PORT = 5000
+        self.DEVICE_TIMEOUT = 300  # 5 minutes
+        self.CHECKIN_TIMEOUT = 600  # 10 minutes
         
         # Start background threads
         self.start_background_threads()
+        app.logger.info("Attendance server initialized")
     
     def start_background_threads(self):
         """Start all background maintenance threads"""
@@ -80,6 +93,8 @@ class AttendanceServer:
         
         device_cleanup_thread = threading.Thread(target=self.cleanup_active_devices, daemon=True)
         device_cleanup_thread.start()
+        
+        app.logger.info("Background threads started")
     
     def update_timers(self):
         """Background thread to update all student timers"""
@@ -112,7 +127,16 @@ class AttendanceServer:
             
             # Check authorization
             checkin = self.student_checkins.get(student_id, {})
-            is_authorized = checkin.get('bssid') == self.authorized_bssid
+            classroom = self.students[student_id]['classroom']
+            
+            # Get authorized BSSID for this student's classroom
+            authorized_bssid = None
+            for teacher in self.teachers.values():
+                if classroom in teacher['bssid_mapping']:
+                    authorized_bssid = teacher['bssid_mapping'][classroom]
+                    break
+            
+            is_authorized = checkin.get('bssid') == authorized_bssid
             
             date_str = datetime.fromtimestamp(timer['start_time']).date().isoformat()
             session_key = f"timer_{int(timer['start_time'])}"
@@ -123,24 +147,27 @@ class AttendanceServer:
             self.students[student_id]['attendance'][date_str][session_key] = {
                 'status': 'present' if is_authorized else 'absent',
                 'subject': 'Timer Session',
-                'classroom': self.students[student_id]['classroom'],
+                'classroom': classroom,
                 'start_time': datetime.fromtimestamp(timer['start_time']).isoformat(),
                 'end_time': datetime.fromtimestamp(timer['start_time'] + timedelta(seconds=self.TIMER_DURATION)).isoformat(),
                 'branch': self.students[student_id]['branch'],
                 'semester': self.students[student_id]['semester']
             }
+            
+            app.logger.info(f"Recorded attendance for {student_id}: {'present' if is_authorized else 'absent'}")
     
     def cleanup_checkins(self):
         """Background thread to clean up old checkins"""
         while True:
             current_time = datetime.now()
-            threshold = current_time - timedelta(minutes=10)
+            threshold = current_time - timedelta(seconds=self.CHECKIN_TIMEOUT)
             
             with self.lock:
                 for student_id in list(self.student_checkins.keys()):
                     last_checkin = self.student_checkins[student_id].get('timestamp')
                     if last_checkin and datetime.fromisoformat(last_checkin) < threshold:
                         del self.student_checkins[student_id]
+                        app.logger.info(f"Cleaned up old checkin for {student_id}")
             
             time.sleep(60)
     
@@ -148,13 +175,14 @@ class AttendanceServer:
         """Background thread to clean up inactive devices"""
         while True:
             current_time = datetime.now()
-            threshold = current_time - timedelta(minutes=5)
+            threshold = current_time - timedelta(seconds=self.DEVICE_TIMEOUT)
             
             with self.lock:
                 for student_id in list(self.active_devices.keys()):
                     last_activity = self.active_devices[student_id].get('last_activity')
                     if last_activity and datetime.fromisoformat(last_activity) < threshold:
                         del self.active_devices[student_id]
+                        app.logger.info(f"Cleaned up inactive device for {student_id}")
             
             time.sleep(60)
     
@@ -171,6 +199,7 @@ class AttendanceServer:
                 'remaining': self.TIMER_DURATION
             }
             
+            app.logger.info(f"Started timer for {student_id}")
             return True
 
 # Initialize the server
@@ -206,6 +235,7 @@ def teacher_signup():
             'semesters': list(range(1, 9))
         }
         
+        app.logger.info(f"New teacher registered: {teacher_id}")
         return jsonify({'message': 'Registration successful'}), 201
 
 @app.route('/teacher/login', methods=['POST'])
@@ -224,6 +254,7 @@ def teacher_login():
     if not check_password_hash(teacher['password'], password):
         return jsonify({'error': 'Incorrect password'}), 401
     
+    app.logger.info(f"Teacher logged in: {teacher_id}")
     return jsonify({
         'message': 'Login successful',
         'teacher': teacher
@@ -256,6 +287,7 @@ def register_student():
             'attendance': {}
         }
         
+        app.logger.info(f"New student registered: {student_id}")
         return jsonify({'message': 'Student registered successfully'}), 201
 
 @app.route('/teacher/get_students', methods=['GET'])
@@ -292,6 +324,7 @@ def update_student():
             if key in server.students[student_id] and key != 'id':
                 server.students[student_id][key] = value
         
+        app.logger.info(f"Updated student: {student_id}")
         return jsonify({'message': 'Student updated successfully'}), 200
 
 @app.route('/teacher/delete_student', methods=['POST'])
@@ -316,6 +349,7 @@ def delete_student():
         if student_id in server.active_devices:
             del server.active_devices[student_id]
         
+        app.logger.info(f"Deleted student: {student_id}")
         return jsonify({'message': 'Student deleted successfully'}), 200
 
 @app.route('/teacher/update_profile', methods=['POST'])
@@ -335,6 +369,7 @@ def update_teacher_profile():
             if key in server.teachers[teacher_id] and key != 'id':
                 server.teachers[teacher_id][key] = value
         
+        app.logger.info(f"Updated teacher profile: {teacher_id}")
         return jsonify({'message': 'Profile updated successfully'}), 200
 
 @app.route('/teacher/change_password', methods=['POST'])
@@ -355,6 +390,7 @@ def change_teacher_password():
             return jsonify({'error': 'Incorrect current password'}), 401
         
         server.teachers[teacher_id]['password'] = generate_password_hash(new_password)
+        app.logger.info(f"Teacher changed password: {teacher_id}")
         return jsonify({'message': 'Password changed successfully'}), 200
 
 @app.route('/teacher/update_bssid', methods=['POST'])
@@ -376,6 +412,7 @@ def update_bssid_mapping():
         if classroom not in server.teachers[teacher_id]['classrooms']:
             server.teachers[teacher_id]['classrooms'].append(classroom)
         
+        app.logger.info(f"Updated BSSID mapping for {classroom}: {bssid}")
         return jsonify({'message': 'BSSID mapping updated successfully'}), 200
 
 @app.route('/teacher/start_session', methods=['POST'])
@@ -412,6 +449,7 @@ def start_session():
             'ad_hoc': data.get('ad_hoc', False)
         }
         
+        app.logger.info(f"Started session {session_id} in {classroom} for {subject}")
         return jsonify({
             'message': 'Session started successfully',
             'session_id': session_id
@@ -447,8 +485,15 @@ def end_session():
                     if date_str not in server.students[student_id]['attendance']:
                         server.students[student_id]['attendance'][date_str] = {}
                     
+                    # Get authorized BSSID for this classroom
+                    authorized_bssid = None
+                    for teacher in server.teachers.values():
+                        if classroom in teacher['bssid_mapping']:
+                            authorized_bssid = teacher['bssid_mapping'][classroom]
+                            break
+                    
                     server.students[student_id]['attendance'][date_str][session_key] = {
-                        'status': 'present' if checkin.get('bssid') == server.authorized_bssid else 'absent',
+                        'status': 'present' if checkin.get('bssid') == authorized_bssid else 'absent',
                         'subject': server.sessions[session_id]['subject'],
                         'classroom': classroom,
                         'start_time': server.sessions[session_id]['start_time'],
@@ -457,6 +502,7 @@ def end_session():
                         'semester': server.sessions[session_id].get('semester')
                     }
         
+        app.logger.info(f"Ended session {session_id}")
         return jsonify({'message': 'Session ended successfully'}), 200
 
 @app.route('/teacher/get_sessions', methods=['GET'])
@@ -496,6 +542,7 @@ def set_bssid():
     
     server.authorized_bssid = bssid
     
+    app.logger.info(f"Global authorized BSSID set to: {bssid}")
     return jsonify({'message': 'Authorized BSSID set successfully'}), 200
 
 @app.route('/teacher/get_status', methods=['GET'])
@@ -515,13 +562,20 @@ def get_status():
             checkin = server.student_checkins.get(student_id, {})
             timer = server.student_timers.get(student_id, {})
             
+            # Get classroom-specific BSSID
+            classroom_bssid = None
+            for teacher in server.teachers.values():
+                if student['classroom'] in teacher['bssid_mapping']:
+                    classroom_bssid = teacher['bssid_mapping'][student['classroom']]
+                    break
+            
             status['students'][student_id] = {
                 'name': student['name'],
                 'classroom': student['classroom'],
                 'branch': student['branch'],
                 'semester': student['semester'],
                 'connected': student_id in server.student_checkins,
-                'authorized': checkin.get('bssid') == server.authorized_bssid,
+                'authorized': checkin.get('bssid') == classroom_bssid,
                 'timestamp': checkin.get('timestamp'),
                 'timer': {
                     'status': timer.get('status', 'stop'),
@@ -553,6 +607,7 @@ def manual_override():
         if status == 'present':
             server.start_timer(student_id)
         
+        app.logger.info(f"Manual override for {student_id}: {status}")
         return jsonify({'message': f'Student {student_id} marked as {status}'}), 200
 
 @app.route('/teacher/random_ring', methods=['POST'])
@@ -596,6 +651,7 @@ def random_ring():
         selected_low = random.choice(low_attendance)
         selected_high = random.choice(high_attendance)
         
+        app.logger.info(f"Random ring in {classroom}: Low={selected_low['id']}, High={selected_high['id']}")
         return jsonify({
             'message': 'Random ring selection complete',
             'low_attendance_student': selected_low,
@@ -619,6 +675,7 @@ def update_special_dates():
         server.holidays = holidays
         server.special_dates = special_dates
     
+    app.logger.info(f"Updated special dates: {len(holidays)} holidays, {len(special_dates)} special dates")
     return jsonify({'message': 'Special dates updated successfully'}), 200
 
 @app.route('/teacher/get_timetable', methods=['GET'])
@@ -648,6 +705,7 @@ def update_timetable():
     with server.lock:
         server.timetables[timetable_key] = timetable
     
+    app.logger.info(f"Updated timetable for {timetable_key}")
     return jsonify({'message': 'Timetable updated successfully'}), 200
 
 # Student endpoints
@@ -676,12 +734,14 @@ def student_login():
             'last_activity': datetime.now().isoformat()
         }
         
+        # Get classroom BSSID from any teacher who has it mapped
         classroom_bssid = None
         for teacher in server.teachers.values():
             if server.students[student_id]['classroom'] in teacher['bssid_mapping']:
                 classroom_bssid = teacher['bssid_mapping'][server.students[student_id]['classroom']]
                 break
         
+        app.logger.info(f"Student logged in: {student_id}")
         return jsonify({
             'message': 'Login successful',
             'student': {
@@ -719,7 +779,7 @@ def student_checkin():
             'device_id': device_id
         }
 
-        # BSSID Verification (per-classroom)
+        # Get classroom-specific authorized BSSID
         student = server.students.get(student_id)
         classroom = student.get('classroom')
         authorized_bssid = None
@@ -731,6 +791,7 @@ def student_checkin():
         if bssid and bssid == authorized_bssid:
             server.start_timer(student_id)
 
+        app.logger.info(f"Student check-in: {student_id} (BSSID: {bssid})")
         return jsonify({
             'message': 'Check-in successful',
             'status': 'present' if bssid and bssid == authorized_bssid else 'absent'
@@ -754,7 +815,7 @@ def student_start_timer():
 
         checkin = server.student_checkins.get(student_id, {})
 
-        # BSSID Verification (per-classroom)
+        # Get classroom-specific authorized BSSID
         classroom = server.students[student_id]['classroom']
         authorized_bssid = None
         for teacher in server.teachers.values():
@@ -769,6 +830,7 @@ def student_start_timer():
 
         server.start_timer(student_id)
 
+        app.logger.info(f"Student started timer: {student_id}")
         return jsonify({
             'message': 'Timer started successfully',
             'status': 'running'
@@ -801,6 +863,7 @@ def student_stop_timer():
         server.student_timers[student_id]['status'] = 'stop'
         server.student_timers[student_id]['remaining'] = 0
         
+        app.logger.info(f"Student stopped timer: {student_id}")
         return jsonify({
             'message': 'Timer stopped successfully',
             'status': 'stop'
@@ -826,18 +889,27 @@ def student_get_status():
         checkin = server.student_checkins.get(student_id, {})
         timer = server.student_timers.get(student_id, {})
         
+        # Get classroom-specific authorized BSSID
+        classroom = server.students[student_id]['classroom']
+        authorized_bssid = None
+        for teacher in server.teachers.values():
+            if classroom in teacher['bssid_mapping']:
+                authorized_bssid = teacher['bssid_mapping'][classroom]
+                break
+        
         status = {
             'student_id': student_id,
             'name': server.students[student_id]['name'],
             'classroom': server.students[student_id]['classroom'],
             'connected': student_id in server.student_checkins,
-            'authorized': checkin.get('bssid') == server.authorized_bssid,
+            'authorized': checkin.get('bssid') == authorized_bssid,
             'timestamp': checkin.get('timestamp'),
             'timer': {
                 'status': timer.get('status', 'stop'),
                 'remaining': timer.get('remaining', 0),
                 'start_time': timer.get('start_time')
-            }
+            },
+            'expected_bssid': authorized_bssid
         }
         
         return jsonify(status), 200
