@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime, timedelta
@@ -1150,53 +1151,69 @@ def student_login():
     student_id = data.get('id')
     password = data.get('password')
     device_id = data.get('device_id')
-
+    
     if not all([student_id, password, device_id]):
-        return jsonify({'error': 'Missing fields'}), 400
-
+        return jsonify({'error': 'ID, password and device ID are required'}), 400
+    
     with server.lock:
         student = server.db.fetch_one('SELECT * FROM students WHERE id = ?', (student_id,))
         if not student:
             return jsonify({'error': 'Student not found'}), 404
-
+        
         if not check_password_hash(student['password'], password):
             return jsonify({'error': 'Incorrect password'}), 401
-
-        # Update active device
-        server.db.execute(
-            'REPLACE INTO active_devices (student_id, device_id, last_activity) VALUES (?, ?, ?)',
-            (student_id, device_id, datetime.now().isoformat()),
-            commit=True
+        
+        # Check if already logged in on another device
+        active_device = server.db.fetch_one(
+            'SELECT * FROM active_devices WHERE student_id = ? AND device_id != ?',
+            (student_id, device_id)
         )
-
-        # Find teacher that manages this classroom
-        teachers = server.db.fetch_all('SELECT id, classrooms, bssid_mapping FROM teachers')
+        if active_device:
+            return jsonify({'error': 'This account is already logged in on another device'}), 403
+        
+        # Update or insert active device
+        existing = server.db.fetch_one(
+            'SELECT 1 FROM active_devices WHERE student_id = ?',
+            (student_id,)
+        )
+        
+        if existing:
+            server.db.execute(
+                'UPDATE active_devices SET device_id = ?, last_activity = ? WHERE student_id = ?',
+                (device_id, datetime.now().isoformat(), student_id),
+                commit=True
+            )
+        else:
+            server.db.execute(
+                'INSERT INTO active_devices (student_id, device_id, last_activity) VALUES (?, ?, ?)',
+                (student_id, device_id, datetime.now().isoformat()),
+                commit=True
+            )
+        
+        # Get classroom BSSID from any teacher
+        teacher = server.db.fetch_one(
+            'SELECT bssid_mapping FROM teachers WHERE json_extract(classrooms, ?) IS NOT NULL',
+            (f'$."{student["classroom"]}"',)
+        )
+        
         classroom_bssid = None
-
-        for teacher in teachers:
-            classrooms = json.loads(teacher['classrooms'])
+        if teacher:
             bssid_mapping = json.loads(teacher['bssid_mapping'])
-
-            if student['classroom'] in classrooms:
-                classroom_bssid = bssid_mapping.get(student['classroom'])
-                break
-
-        # Clean up old sessions for this student/device
-        server.db.execute(
-            'DELETE FROM checkins WHERE student_id = ? AND device_id = ?',
-            (student_id, device_id),
-            commit=True
-        )
-
-        student_dict = dict(student)
-        student_dict['attendance'] = json.loads(student_dict['attendance']) if student_dict['attendance'] else {}
-
+            classroom_bssid = bssid_mapping.get(student['classroom'])
+        
         return jsonify({
             'message': 'Login successful',
-            'student': student_dict,
+            'student': {
+                'id': student['id'],
+                'name': student['name'],
+                'classroom': student['classroom'],
+                'branch': student['branch'],
+                'semester': student['semester']
+            },
             'classroom_bssid': classroom_bssid
         }), 200
 
+@app.route('/student/checkin', methods=['POST'])
 def student_checkin():
     data = request.json
     student_id = data.get('student_id')
