@@ -733,29 +733,67 @@ def student_checkin():
 
         server.active_devices[student_id]['last_activity'] = datetime.now().isoformat()
 
-        server.student_checkins[student_id] = {
-            'timestamp': datetime.now().isoformat(),
-            'bssid': bssid if bssid else None,
-            'device_id': device_id
-        }
+        # Get student's classroom
+        classroom = server.students[student_id]['classroom']
+        
+        # Check for active session in this classroom
+        active_session = None
+        for session in server.sessions.values():
+            if session['classroom'] == classroom and not session.get('end_time'):
+                active_session = session
+                break
 
-        # BSSID Verification (per-classroom)
-        student = server.students.get(student_id)
-        classroom = student.get('classroom')
+        # Get authorized BSSID for classroom
         authorized_bssid = None
         for teacher in server.teachers.values():
             if classroom in teacher['bssid_mapping']:
                 authorized_bssid = teacher['bssid_mapping'][classroom]
                 break
 
-        if bssid and bssid == authorized_bssid:
-            server.start_timer(student_id)
+        # Record check-in
+        server.student_checkins[student_id] = {
+            'timestamp': datetime.now().isoformat(),
+            'bssid': bssid if bssid else None,
+            'device_id': device_id
+        }
 
-        return jsonify({
-            'message': 'Check-in successful',
-            'status': 'present' if bssid and bssid == authorized_bssid else 'absent',
-            'authorized_bssid': authorized_bssid
-        }), 200
+        # If there's an active session and BSSID matches, record attendance immediately
+        if active_session and bssid and bssid == authorized_bssid:
+            date_str = datetime.now().date().isoformat()
+            session_key = f"{active_session['subject']}_{active_session['id']}"
+            
+            if date_str not in server.students[student_id]['attendance']:
+                server.students[student_id]['attendance'][date_str] = {}
+            
+            server.students[student_id]['attendance'][date_str][session_key] = {
+                'status': 'present',
+                'subject': active_session['subject'],
+                'classroom': classroom,
+                'start_time': active_session['start_time'],
+                'end_time': datetime.now().isoformat(),
+                'branch': active_session.get('branch'),
+                'semester': active_session.get('semester')
+            }
+            
+            return jsonify({
+                'message': 'Check-in successful (session active)',
+                'status': 'present',
+                'authorized_bssid': authorized_bssid
+            }), 200
+        # If no active session but BSSID matches, start timer
+        elif bssid and bssid == authorized_bssid:
+            server.start_timer(student_id)
+            return jsonify({
+                'message': 'Check-in successful (timer started)',
+                'status': 'pending',
+                'authorized_bssid': authorized_bssid
+            }), 200
+        else:
+            return jsonify({
+                'message': 'Check-in recorded (not authorized)',
+                'status': 'absent',
+                'authorized_bssid': authorized_bssid
+            }), 200
 
 @app.route('/student/timer/start', methods=['POST'])
 def student_start_timer():
