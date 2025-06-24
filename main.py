@@ -1146,6 +1146,57 @@ def update_timetable():
 # Student endpoints
 @app.route('/student/login', methods=['POST'])
 def student_login():
+    data = request.json
+    student_id = data.get('id')
+    password = data.get('password')
+    device_id = data.get('device_id')
+
+    if not all([student_id, password, device_id]):
+        return jsonify({'error': 'Missing fields'}), 400
+
+    with server.lock:
+        student = server.db.fetch_one('SELECT * FROM students WHERE id = ?', (student_id,))
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+
+        if not check_password_hash(student['password'], password):
+            return jsonify({'error': 'Incorrect password'}), 401
+
+        # Update active device
+        server.db.execute(
+            'REPLACE INTO active_devices (student_id, device_id, last_activity) VALUES (?, ?, ?)',
+            (student_id, device_id, datetime.now().isoformat()),
+            commit=True
+        )
+
+        # Find teacher that manages this classroom
+        teachers = server.db.fetch_all('SELECT id, classrooms, bssid_mapping FROM teachers')
+        classroom_bssid = None
+
+        for teacher in teachers:
+            classrooms = json.loads(teacher['classrooms'])
+            bssid_mapping = json.loads(teacher['bssid_mapping'])
+
+            if student['classroom'] in classrooms:
+                classroom_bssid = bssid_mapping.get(student['classroom'])
+                break
+
+        # Clean up old sessions for this student/device
+        server.db.execute(
+            'DELETE FROM checkins WHERE student_id = ? AND device_id = ?',
+            (student_id, device_id),
+            commit=True
+        )
+
+        student_dict = dict(student)
+        student_dict['attendance'] = json.loads(student_dict['attendance']) if student_dict['attendance'] else {}
+
+        return jsonify({
+            'message': 'Login successful',
+            'student': student_dict,
+            'classroom_bssid': classroom_bssid
+        }), 200
+
 def student_checkin():
     data = request.json
     student_id = data.get('student_id')
