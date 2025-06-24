@@ -182,6 +182,11 @@ class AttendanceServer:
                     last_activity = self.active_devices[student_id].get('last_activity')
                     if last_activity and datetime.fromisoformat(last_activity) < threshold:
                         del self.active_devices[student_id]
+                        # Also clean up any associated timers and checkins
+                        if student_id in self.student_timers:
+                            del self.student_timers[student_id]
+                        if student_id in self.student_checkins:
+                            del self.student_checkins[student_id]
                         app.logger.info(f"Cleaned up inactive device for {student_id}")
             
             time.sleep(60)
@@ -1002,6 +1007,30 @@ def student_ping():
         server.active_devices[student_id]['last_activity'] = datetime.now().isoformat()
         
         return jsonify({'message': 'Ping successful'}), 200
+
+@app.route('/student/cleanup_dead_sessions', methods=['POST'])
+def cleanup_dead_sessions():
+    """Endpoint to clean up when client is killed"""
+    data = request.json
+    student_id = data.get('student_id')
+    device_id = data.get('device_id')
+    
+    if not all([student_id, device_id]):
+        return jsonify({'error': 'Student ID and device ID are required'}), 400
+    
+    with server.lock:
+        if student_id in server.active_devices and server.active_devices[student_id]['device_id'] == device_id:
+            # Clean up all client-related data
+            if student_id in server.student_checkins:
+                del server.student_checkins[student_id]
+            if student_id in server.student_timers:
+                del server.student_timers[student_id]
+            del server.active_devices[student_id]
+            
+            app.logger.info(f"Cleaned up dead session for {student_id}")
+            return jsonify({'message': 'Session cleaned up successfully'}), 200
+        else:
+            return jsonify({'error': 'Invalid session'}), 400
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=server.SERVER_PORT, debug=True)
