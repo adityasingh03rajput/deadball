@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from datetime import datetime, timedelta
@@ -27,7 +26,13 @@ logging.basicConfig(
 )
 
 app = Flask(__name__, static_folder='dist', static_url_path='')
-CORS(app, origins=["*"])
+CORS(app, resources={
+    r"/api/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 class AttendanceDatabase:
     def __init__(self, db_path='attendance.db'):
@@ -130,6 +135,9 @@ class AttendanceDatabase:
         conn.row_factory = sqlite3.Row
         try:
             yield conn
+        except sqlite3.Error as e:
+            logging.error(f"Database error: {e}")
+            raise
         finally:
             conn.close()
 
@@ -329,6 +337,14 @@ class AttendanceServer:
 # Initialize the server
 server = AttendanceServer()
 
+@app.after_request
+def after_request(response):
+    """Add CORS headers to every response"""
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
 # Serve React app
 @app.route('/')
 def serve_index():
@@ -427,7 +443,10 @@ def teacher_login():
 @app.route('/api/teacher/register_student', methods=['POST'])
 def register_student():
     try:
-        data = request.json
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
         student_id = data.get('id', '').strip()
         password = data.get('password', '')
         name = data.get('name', '').strip()
@@ -452,8 +471,14 @@ def register_student():
             ''', (student_id, generate_password_hash(password), name, classroom, branch, int(semester)))
             conn.commit()
             
-            return jsonify({'message': 'Student registered successfully'}), 201
+            return jsonify({
+                'message': 'Student registered successfully',
+                'student_id': student_id
+            }), 201
             
+    except sqlite3.Error as e:
+        logging.error(f"Database error in register_student: {e}")
+        return jsonify({'error': 'Database error occurred'}), 500
     except Exception as e:
         logging.error(f"Error in register_student: {e}")
         return jsonify({'error': 'Internal server error'}), 500
@@ -488,215 +513,6 @@ def get_students():
             
     except Exception as e:
         logging.error(f"Error in get_students: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/teacher/update_student', methods=['POST'])
-def update_student():
-    try:
-        data = request.json
-        student_id = data.get('id', '').strip()
-        new_data = data.get('new_data', {})
-        
-        if not student_id or not new_data:
-            return jsonify({'error': 'Student ID and new data are required'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Check if student exists
-            cursor.execute('SELECT id FROM students WHERE id = ?', (student_id,))
-            if not cursor.fetchone():
-                return jsonify({'error': 'Student not found'}), 404
-            
-            # Build update query dynamically
-            update_fields = []
-            params = []
-            
-            for key, value in new_data.items():
-                if key in ['name', 'classroom', 'branch', 'semester']:
-                    update_fields.append(f"{key} = ?")
-                    params.append(value)
-            
-            if not update_fields:
-                return jsonify({'error': 'No valid fields to update'}), 400
-            
-            params.append(student_id)
-            query = f"UPDATE students SET {', '.join(update_fields)} WHERE id = ?"
-            
-            cursor.execute(query, params)
-            conn.commit()
-            
-            return jsonify({'message': 'Student updated successfully'}), 200
-            
-    except Exception as e:
-        logging.error(f"Error in update_student: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/teacher/delete_student', methods=['POST'])
-def delete_student():
-    try:
-        data = request.json
-        student_id = data.get('id', '').strip()
-        
-        if not student_id:
-            return jsonify({'error': 'Student ID is required'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Check if student exists
-            cursor.execute('SELECT id FROM students WHERE id = ?', (student_id,))
-            if not cursor.fetchone():
-                return jsonify({'error': 'Student not found'}), 404
-            
-            # Delete student
-            cursor.execute('DELETE FROM students WHERE id = ?', (student_id,))
-            conn.commit()
-            
-            # Clean up related data
-            with server.checkins_lock, server.timers_lock, server.devices_lock:
-                if student_id in server.student_checkins:
-                    del server.student_checkins[student_id]
-                if student_id in server.student_timers:
-                    del server.student_timers[student_id]
-                if student_id in server.active_devices:
-                    del server.active_devices[student_id]
-            
-            return jsonify({'message': 'Student deleted successfully'}), 200
-            
-    except Exception as e:
-        logging.error(f"Error in delete_student: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/teacher/update_profile', methods=['POST'])
-def update_teacher_profile():
-    try:
-        data = request.json
-        teacher_id = data.get('id', '').strip()
-        new_data = data.get('new_data', {})
-        
-        if not teacher_id or not new_data:
-            return jsonify({'error': 'Teacher ID and new data are required'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Check if teacher exists
-            cursor.execute('SELECT id FROM teachers WHERE id = ?', (teacher_id,))
-            if not cursor.fetchone():
-                return jsonify({'error': 'Teacher not found'}), 404
-            
-            # Build update query dynamically
-            update_fields = []
-            params = []
-            
-            for key, value in new_data.items():
-                if key in ['name', 'email', 'classrooms', 'bssid_mapping', 'branches', 'semesters']:
-                    update_fields.append(f"{key} = ?")
-                    if isinstance(value, (list, dict)):
-                        params.append(json.dumps(value))
-                    else:
-                        params.append(value)
-            
-            if not update_fields:
-                return jsonify({'error': 'No valid fields to update'}), 400
-            
-            params.append(teacher_id)
-            query = f"UPDATE teachers SET {', '.join(update_fields)} WHERE id = ?"
-            
-            cursor.execute(query, params)
-            conn.commit()
-            
-            return jsonify({'message': 'Profile updated successfully'}), 200
-            
-    except Exception as e:
-        logging.error(f"Error in update_teacher_profile: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/teacher/change_password', methods=['POST'])
-def change_teacher_password():
-    try:
-        data = request.json
-        teacher_id = data.get('id', '').strip()
-        old_password = data.get('old_password', '')
-        new_password = data.get('new_password', '')
-        
-        if not all([teacher_id, old_password, new_password]):
-            return jsonify({'error': 'All fields are required'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Get teacher
-            cursor.execute('SELECT password FROM teachers WHERE id = ?', (teacher_id,))
-            teacher = cursor.fetchone()
-            if not teacher:
-                return jsonify({'error': 'Teacher not found'}), 404
-            
-            # Verify old password
-            if not check_password_hash(teacher['password'], old_password):
-                return jsonify({'error': 'Incorrect current password'}), 401
-            
-            # Update password
-            cursor.execute(
-                'UPDATE teachers SET password = ? WHERE id = ?',
-                (generate_password_hash(new_password), teacher_id)
-            )
-            conn.commit()
-            
-            return jsonify({'message': 'Password changed successfully'}), 200
-            
-    except Exception as e:
-        logging.error(f"Error in change_teacher_password: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/teacher/update_bssid', methods=['POST'])
-def update_bssid_mapping():
-    try:
-        data = request.json
-        teacher_id = data.get('teacher_id', '').strip()
-        classroom = data.get('classroom', '').strip()
-        bssid = data.get('bssid', '')
-        
-        if not all([teacher_id, classroom]):
-            return jsonify({'error': 'Teacher ID and classroom are required'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Get teacher
-            cursor.execute('SELECT bssid_mapping, classrooms FROM teachers WHERE id = ?', (teacher_id,))
-            teacher = cursor.fetchone()
-            if not teacher:
-                return jsonify({'error': 'Teacher not found'}), 404
-            
-            # Update BSSID mapping
-            bssid_mapping = json.loads(teacher['bssid_mapping'] or '{}')
-            classrooms = json.loads(teacher['classrooms'] or '[]')
-            
-            if bssid:
-                bssid_mapping[classroom] = bssid
-            elif classroom in bssid_mapping:
-                del bssid_mapping[classroom]
-            
-            # Add classroom to teacher's classrooms if not already present
-            if classroom not in classrooms:
-                classrooms.append(classroom)
-            
-            # Update database
-            cursor.execute(
-                'UPDATE teachers SET bssid_mapping = ?, classrooms = ? WHERE id = ?',
-                (json.dumps(bssid_mapping), json.dumps(classrooms), teacher_id)
-            )
-            conn.commit()
-            
-            return jsonify({
-                'message': 'BSSID mapping updated successfully',
-                'bssid_mapping': bssid_mapping
-            }), 200
-            
-    except Exception as e:
-        logging.error(f"Error in update_bssid_mapping: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/api/teacher/start_session', methods=['POST'])
@@ -827,77 +643,6 @@ def end_session():
         logging.error(f"Error in end_session: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
-@app.route('/api/teacher/get_sessions', methods=['GET'])
-def get_sessions():
-    try:
-        teacher_id = request.args.get('teacher_id')
-        classroom = request.args.get('classroom')
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            query = 'SELECT * FROM sessions WHERE 1=1'
-            params = []
-            
-            if teacher_id:
-                query += ' AND teacher_id = ?'
-                params.append(teacher_id)
-            if classroom:
-                query += ' AND classroom = ?'
-                params.append(classroom)
-            
-            query += ' ORDER BY start_time DESC'
-            
-            cursor.execute(query, params)
-            sessions = [dict(row) for row in cursor.fetchall()]
-            
-            return jsonify({'sessions': sessions}), 200
-            
-    except Exception as e:
-        logging.error(f"Error in get_sessions: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/teacher/get_active_sessions', methods=['GET'])
-def get_active_sessions():
-    try:
-        teacher_id = request.args.get('teacher_id')
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            query = 'SELECT * FROM sessions WHERE end_time IS NULL'
-            params = []
-            
-            if teacher_id:
-                query += ' AND teacher_id = ?'
-                params.append(teacher_id)
-            
-            cursor.execute(query, params)
-            sessions = [dict(row) for row in cursor.fetchall()]
-            
-            return jsonify({'sessions': sessions}), 200
-            
-    except Exception as e:
-        logging.error(f"Error in get_active_sessions: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/teacher/set_bssid', methods=['POST'])
-def set_bssid():
-    try:
-        data = request.json
-        bssid = data.get('bssid', '')
-        
-        if not bssid:
-            return jsonify({'error': 'BSSID is required'}), 400
-        
-        server.authorized_bssid = bssid
-        
-        return jsonify({'message': 'Authorized BSSID set successfully'}), 200
-        
-    except Exception as e:
-        logging.error(f"Error in set_bssid: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
 @app.route('/api/teacher/get_status', methods=['GET'])
 def get_teacher_status():
     try:
@@ -945,94 +690,6 @@ def get_teacher_status():
         
     except Exception as e:
         logging.error(f"Error in get_teacher_status: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/teacher/manual_override', methods=['POST'])
-def manual_override():
-    try:
-        data = request.json
-        student_id = data.get('student_id', '').strip()
-        status = data.get('status', '')
-        
-        if not all([student_id, status]):
-            return jsonify({'error': 'Student ID and status are required'}), 400
-        
-        if status not in ['present', 'absent']:
-            return jsonify({'error': 'Status must be "present" or "absent"'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id FROM students WHERE id = ?', (student_id,))
-            if not cursor.fetchone():
-                return jsonify({'error': 'Student not found'}), 404
-        
-        server.manual_overrides[student_id] = status
-        
-        if status == 'present':
-            server.start_timer(student_id)
-        
-        return jsonify({'message': f'Student {student_id} marked as {status}'}), 200
-        
-    except Exception as e:
-        logging.error(f"Error in manual_override: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/teacher/random_ring', methods=['POST'])
-def random_ring():
-    try:
-        classroom = request.args.get('classroom')
-        
-        if not classroom:
-            return jsonify({'error': 'Classroom is required'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Get all students in the classroom with attendance data
-            cursor.execute('SELECT * FROM students WHERE classroom = ?', (classroom,))
-            students = cursor.fetchall()
-            
-            if len(students) < 2:
-                return jsonify({'error': 'Need at least 2 students for random ring'}), 400
-            
-            classroom_students = []
-            for student in students:
-                attendance_records = []
-                attendance = json.loads(student['attendance'] or '{}')
-                
-                for date, sessions in attendance.items():
-                    for session in sessions.values():
-                        attendance_records.append(session['status'])
-                
-                total = len(attendance_records)
-                present = sum(1 for s in attendance_records if s == 'present')
-                percentage = round((present / total) * 100) if total > 0 else 0
-                
-                classroom_students.append({
-                    'id': student['id'],
-                    'name': student['name'],
-                    'attendance_percentage': percentage
-                })
-            
-            # Sort students by attendance
-            sorted_students = sorted(classroom_students, key=lambda x: x['attendance_percentage'])
-            
-            # Select one from top 30% and one from bottom 30%
-            split_point = max(1, len(sorted_students) // 3)
-            low_attendance = sorted_students[:split_point]
-            high_attendance = sorted_students[-split_point:]
-            
-            selected_low = random.choice(low_attendance)
-            selected_high = random.choice(high_attendance)
-            
-            return jsonify({
-                'message': 'Random ring selection complete',
-                'low_attendance_student': selected_low,
-                'high_attendance_student': selected_high
-            }), 200
-            
-    except Exception as e:
-        logging.error(f"Error in random_ring: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 # Student endpoints
@@ -1149,98 +806,6 @@ def student_checkin():
         logging.error(f"Error in student_checkin: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
-@app.route('/api/student/timer/start', methods=['POST'])
-def student_start_timer():
-    try:
-        data = request.json
-        student_id = data.get('student_id', '').strip()
-        device_id = data.get('device_id', '').strip()
-        
-        if not all([student_id, device_id]):
-            return jsonify({'error': 'Student ID and device ID are required'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT classroom FROM students WHERE id = ?', (student_id,))
-            student = cursor.fetchone()
-            
-            if not student:
-                return jsonify({'error': 'Student not found'}), 404
-        
-        with server.devices_lock:
-            if student_id not in server.active_devices or server.active_devices[student_id]['device_id'] != device_id:
-                return jsonify({'error': 'Unauthorized device'}), 403
-            
-            server.active_devices[student_id]['last_activity'] = datetime.now().isoformat()
-        
-        with server.checkins_lock:
-            checkin = server.student_checkins.get(student_id, {})
-            
-            # Get authorized BSSID for classroom
-            classroom = student['classroom']
-            authorized_bssid = None
-            cursor.execute('SELECT bssid_mapping FROM teachers')
-            for teacher in cursor.fetchall():
-                bssid_mapping = json.loads(teacher['bssid_mapping'] or '{}')
-                if classroom in bssid_mapping:
-                    authorized_bssid = bssid_mapping[classroom]
-                    break
-            
-            if checkin.get('bssid') != authorized_bssid:
-                return jsonify({'error': 'Not authorized to start timer - BSSID mismatch'}), 403
-        
-        server.start_timer(student_id)
-        
-        return jsonify({
-            'message': 'Timer started successfully',
-            'status': 'running'
-        }), 200
-        
-    except Exception as e:
-        logging.error(f"Error in student_start_timer: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/student/timer/stop', methods=['POST'])
-def student_stop_timer():
-    try:
-        data = request.json
-        student_id = data.get('student_id', '').strip()
-        device_id = data.get('device_id', '').strip()
-        
-        if not all([student_id, device_id]):
-            return jsonify({'error': 'Student ID and device ID are required'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id FROM students WHERE id = ?', (student_id,))
-            if not cursor.fetchone():
-                return jsonify({'error': 'Student not found'}), 404
-        
-        with server.devices_lock:
-            if student_id not in server.active_devices or server.active_devices[student_id]['device_id'] != device_id:
-                return jsonify({'error': 'Unauthorized device'}), 403
-            
-            server.active_devices[student_id]['last_activity'] = datetime.now().isoformat()
-        
-        with server.timers_lock:
-            if student_id not in server.student_timers or server.student_timers[student_id]['status'] == 'stop':
-                return jsonify({'error': 'No active timer to stop'}), 400
-            
-            if server.student_timers[student_id]['status'] == 'running':
-                server.record_attendance(student_id)
-            
-            server.student_timers[student_id]['status'] = 'stop'
-            server.student_timers[student_id]['remaining'] = 0
-        
-        return jsonify({
-            'message': 'Timer stopped successfully',
-            'status': 'stop'
-        }), 200
-        
-    except Exception as e:
-        logging.error(f"Error in student_stop_timer: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
 @app.route('/api/student/get_status', methods=['GET'])
 def student_get_status():
     try:
@@ -1286,127 +851,6 @@ def student_get_status():
         
     except Exception as e:
         logging.error(f"Error in student_get_status: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/student/get_attendance', methods=['GET'])
-def student_get_attendance():
-    try:
-        student_id = request.args.get('student_id', '').strip()
-        device_id = request.args.get('device_id', '').strip()
-        
-        if not all([student_id, device_id]):
-            return jsonify({'error': 'Student ID and device ID are required'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT attendance FROM students WHERE id = ?', (student_id,))
-            student = cursor.fetchone()
-            
-            if not student:
-                return jsonify({'error': 'Student not found'}), 404
-        
-        with server.devices_lock:
-            if student_id not in server.active_devices or server.active_devices[student_id]['device_id'] != device_id:
-                return jsonify({'error': 'Unauthorized device'}), 403
-            
-            server.active_devices[student_id]['last_activity'] = datetime.now().isoformat()
-        
-        attendance = json.loads(student['attendance'] or '{}')
-        
-        return jsonify({'attendance': attendance}), 200
-        
-    except Exception as e:
-        logging.error(f"Error in student_get_attendance: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/student/get_active_session', methods=['GET'])
-def get_active_session():
-    try:
-        student_id = request.args.get('student_id', '').strip()
-        classroom = request.args.get('classroom', '').strip()
-        
-        if not student_id or not classroom:
-            return jsonify({'error': 'Student ID and classroom are required'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Check if student exists
-            cursor.execute('SELECT id FROM students WHERE id = ?', (student_id,))
-            if not cursor.fetchone():
-                return jsonify({'error': 'Student not found'}), 404
-            
-            # Check for active session in the student's classroom
-            cursor.execute('''
-                SELECT * FROM sessions 
-                WHERE classroom = ? AND end_time IS NULL
-            ''', (classroom,))
-            session = cursor.fetchone()
-            
-            if session:
-                return jsonify({
-                    'active': True,
-                    'session': dict(session)
-                }), 200
-            else:
-                return jsonify({'active': False}), 200
-                
-    except Exception as e:
-        logging.error(f"Error in get_active_session: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/student/ping', methods=['POST'])
-def student_ping():
-    try:
-        data = request.json
-        student_id = data.get('student_id', '').strip()
-        device_id = data.get('device_id', '').strip()
-        
-        if not all([student_id, device_id]):
-            return jsonify({'error': 'Student ID and device ID are required'}), 400
-        
-        with server.db.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id FROM students WHERE id = ?', (student_id,))
-            if not cursor.fetchone():
-                return jsonify({'error': 'Student not found'}), 404
-        
-        with server.devices_lock:
-            if student_id not in server.active_devices or server.active_devices[student_id]['device_id'] != device_id:
-                return jsonify({'error': 'Unauthorized device'}), 403
-            
-            server.active_devices[student_id]['last_activity'] = datetime.now().isoformat()
-        
-        return jsonify({'message': 'Ping successful'}), 200
-        
-    except Exception as e:
-        logging.error(f"Error in student_ping: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/student/cleanup_dead_sessions', methods=['POST'])
-def cleanup_dead_sessions():
-    try:
-        data = request.json
-        student_id = data.get('student_id', '').strip()
-        device_id = data.get('device_id', '').strip()
-        
-        if not all([student_id, device_id]):
-            return jsonify({'error': 'Student ID and device ID are required'}), 400
-        
-        with server.checkins_lock, server.timers_lock, server.devices_lock:
-            if student_id in server.active_devices and server.active_devices[student_id]['device_id'] == device_id:
-                del server.active_devices[student_id]
-            
-            if student_id in server.student_checkins:
-                del server.student_checkins[student_id]
-            
-            if student_id in server.student_timers:
-                del server.student_timers[student_id]
-        
-        return jsonify({'message': 'Session cleanup completed'}), 200
-        
-    except Exception as e:
-        logging.error(f"Error in cleanup_dead_sessions: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == '__main__':
