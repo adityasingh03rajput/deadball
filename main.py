@@ -61,7 +61,6 @@ class AttendanceServer:
         self.student_timers = {}
         self.manual_overrides = {}
         self.active_devices = {}
-        self.authorized_bssid = None
         self.holidays = []
         self.special_dates = []
         self.timetables = {
@@ -412,13 +411,28 @@ def update_bssid_mapping():
         if teacher_id not in server.teachers:
             return jsonify({'error': 'Teacher not found'}), 404
         
+        # Normalize BSSID to uppercase for consistency
+        bssid = bssid.upper() if bssid else None
+        
+        # Update the BSSID mapping
         server.teachers[teacher_id]['bssid_mapping'][classroom] = bssid
         
+        # Add classroom if not already present
         if classroom not in server.teachers[teacher_id]['classrooms']:
             server.teachers[teacher_id]['classrooms'].append(classroom)
         
+        # Update all students in this classroom
+        for student_id, student in server.students.items():
+            if student['classroom'] == classroom:
+                # Force clients to refresh their expected BSSID on next check
+                if student_id in server.student_checkins:
+                    server.student_checkins[student_id]['bssid_updated'] = True
+        
         app.logger.info(f"Updated BSSID mapping for {classroom}: {bssid}")
-        return jsonify({'message': 'BSSID mapping updated successfully'}), 200
+        return jsonify({
+            'message': 'BSSID mapping updated successfully',
+            'updated_bssid': bssid
+        }), 200
 
 @app.route('/teacher/start_session', methods=['POST'])
 def start_session():
@@ -545,7 +559,18 @@ def set_bssid():
     if not bssid:
         return jsonify({'error': 'BSSID is required'}), 400
     
-    server.authorized_bssid = bssid
+    # Normalize BSSID to uppercase
+    bssid = bssid.upper()
+    
+    # Update all teachers' BSSID mappings for their classrooms
+    with server.lock:
+        for teacher in server.teachers.values():
+            for classroom in teacher['classrooms']:
+                teacher['bssid_mapping'][classroom] = bssid
+        
+        # Update all student checkins to force refresh
+        for student_id in server.student_checkins:
+            server.student_checkins[student_id]['bssid_updated'] = True
     
     app.logger.info(f"Global authorized BSSID set to: {bssid}")
     return jsonify({'message': 'Authorized BSSID set successfully'}), 200
@@ -555,11 +580,20 @@ def get_status():
     classroom = request.args.get('classroom')
     
     status = {
-        'authorized_bssid': server.authorized_bssid,
         'students': {}
     }
     
     with server.lock:
+        # Get the authorized BSSID for the classroom
+        authorized_bssid = None
+        if classroom:
+            for teacher in server.teachers.values():
+                if classroom in teacher['bssid_mapping']:
+                    authorized_bssid = teacher['bssid_mapping'][classroom]
+                    break
+        
+        status['authorized_bssid'] = authorized_bssid
+        
         for student_id, student in server.students.items():
             if classroom and student['classroom'] != classroom:
                 continue
@@ -567,20 +601,13 @@ def get_status():
             checkin = server.student_checkins.get(student_id, {})
             timer = server.student_timers.get(student_id, {})
             
-            # Get classroom-specific BSSID
-            classroom_bssid = None
-            for teacher in server.teachers.values():
-                if student['classroom'] in teacher['bssid_mapping']:
-                    classroom_bssid = teacher['bssid_mapping'][student['classroom']]
-                    break
-            
             status['students'][student_id] = {
                 'name': student['name'],
                 'classroom': student['classroom'],
                 'branch': student['branch'],
                 'semester': student['semester'],
                 'connected': student_id in server.student_checkins,
-                'authorized': checkin.get('bssid') == classroom_bssid,
+                'authorized': checkin.get('bssid') == authorized_bssid,
                 'timestamp': checkin.get('timestamp'),
                 'timer': {
                     'status': timer.get('status', 'stop'),
@@ -691,7 +718,7 @@ def get_timetable():
     timetable_key = f"{branch}_{semester}" if branch and semester else "default"
     
     with server.lock:
-        timetable = server.timetables.get(timetable_key, {})
+        timetable = server.timetables.get(timetable_key, [])
     
     return jsonify({'timetable': timetable}), 200
 
@@ -700,7 +727,7 @@ def update_timetable():
     data = request.json
     branch = data.get('branch')
     semester = data.get('semester')
-    timetable = data.get('timetable', {})
+    timetable = data.get('timetable', [])
     
     if not branch or not semester:
         return jsonify({'error': 'Branch and semester are required'}), 400
@@ -740,10 +767,11 @@ def student_login():
         }
         
         # Get classroom BSSID from any teacher who has it mapped
-        classroom_bssid = None
+        classroom = server.students[student_id]['classroom']
+        authorized_bssid = None
         for teacher in server.teachers.values():
-            if server.students[student_id]['classroom'] in teacher['bssid_mapping']:
-                classroom_bssid = teacher['bssid_mapping'][server.students[student_id]['classroom']]
+            if classroom in teacher['bssid_mapping']:
+                authorized_bssid = teacher['bssid_mapping'][classroom]
                 break
         
         app.logger.info(f"Student logged in: {student_id}")
@@ -756,7 +784,7 @@ def student_login():
                 'branch': server.students[student_id]['branch'],
                 'semester': server.students[student_id]['semester']
             },
-            'classroom_bssid': classroom_bssid
+            'classroom_bssid': authorized_bssid
         }), 200
 
 @app.route('/student/checkin', methods=['POST'])
@@ -778,20 +806,24 @@ def student_checkin():
 
         server.active_devices[student_id]['last_activity'] = datetime.now().isoformat()
 
-        server.student_checkins[student_id] = {
-            'timestamp': datetime.now().isoformat(),
-            'bssid': bssid if bssid else None,
-            'device_id': device_id
-        }
-
         # Get classroom-specific authorized BSSID
-        student = server.students.get(student_id)
-        classroom = student.get('classroom')
+        classroom = server.students[student_id]['classroom']
         authorized_bssid = None
         for teacher in server.teachers.values():
             if classroom in teacher['bssid_mapping']:
                 authorized_bssid = teacher['bssid_mapping'][classroom]
                 break
+
+        # Normalize BSSID to uppercase for comparison
+        bssid = bssid.upper() if bssid else None
+        authorized_bssid = authorized_bssid.upper() if authorized_bssid else None
+
+        server.student_checkins[student_id] = {
+            'timestamp': datetime.now().isoformat(),
+            'bssid': bssid,
+            'device_id': device_id,
+            'bssid_updated': False  # Flag to indicate if BSSID was updated
+        }
 
         if bssid and bssid == authorized_bssid:
             server.start_timer(student_id)
@@ -799,7 +831,8 @@ def student_checkin():
         app.logger.info(f"Student check-in: {student_id} (BSSID: {bssid})")
         return jsonify({
             'message': 'Check-in successful',
-            'status': 'present' if bssid and bssid == authorized_bssid else 'absent'
+            'status': 'present' if bssid and bssid == authorized_bssid else 'absent',
+            'expected_bssid': authorized_bssid
         }), 200
 
 @app.route('/student/timer/start', methods=['POST'])
@@ -914,8 +947,13 @@ def student_get_status():
                 'remaining': timer.get('remaining', 0),
                 'start_time': timer.get('start_time')
             },
-            'expected_bssid': authorized_bssid
+            'expected_bssid': authorized_bssid,
+            'bssid_updated': checkin.get('bssid_updated', False)
         }
+        
+        # Reset the bssid_updated flag after sending it to client
+        if student_id in server.student_checkins:
+            server.student_checkins[student_id]['bssid_updated'] = False
         
         return jsonify(status), 200
 
@@ -982,7 +1020,7 @@ def student_get_timetable():
             return jsonify({'error': 'Student not found'}), 404
         
         timetable_key = f"{branch}_{semester}"
-        timetable = server.timetables.get(timetable_key, {})
+        timetable = server.timetables.get(timetable_key, [])
         
         return jsonify({
             'timetable': timetable
