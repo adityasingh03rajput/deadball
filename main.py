@@ -61,8 +61,10 @@ class AttendanceServer:
         self.student_timers = {}
         self.manual_overrides = {}
         self.active_devices = {}
-        self.holidays = []
-        self.special_dates = []
+        self.special_dates = {
+            "holidays": [],
+            "special_schedules": []
+        }
         self.timetables = {
             "CSE_3": [
                 ["Monday", "09:00", "10:00", "Mathematics", "A101"],
@@ -147,8 +149,8 @@ class AttendanceServer:
                 'status': 'present' if is_authorized else 'absent',
                 'subject': 'Timer Session',
                 'classroom': classroom,
-                'start_time': datetime.fromtimestamp(timer['start_time']).isoformat(),
-                'end_time': datetime.fromtimestamp(timer['start_time'] + timedelta(seconds=self.TIMER_DURATION)).isoformat(),
+                'start_time': datetime.fromtimestamp(timer['start_time']).strftime("%H:%M:%S"),
+                'end_time': datetime.fromtimestamp(timer['start_time'] + self.TIMER_DURATION).strftime("%H:%M:%S"),
                 'branch': self.students[student_id]['branch'],
                 'semester': self.students[student_id]['semester']
             }
@@ -442,6 +444,7 @@ def start_session():
     subject = data.get('subject')
     branch = data.get('branch')
     semester = data.get('semester')
+    ad_hoc = data.get('ad_hoc', False)
     
     if not all([teacher_id, classroom, subject]):
         return jsonify({'error': 'Teacher ID, classroom and subject are required'}), 400
@@ -455,7 +458,7 @@ def start_session():
             if session['classroom'] == classroom and not session.get('end_time'):
                 return jsonify({'error': 'There is already an active session for this classroom'}), 400
         
-        session_id = f"session_{len(server.sessions) + 1}"
+        session_id = str(uuid.uuid4())
         server.sessions[session_id] = {
             'id': session_id,
             'teacher_id': teacher_id,
@@ -465,7 +468,7 @@ def start_session():
             'semester': semester,
             'start_time': datetime.now().isoformat(),
             'end_time': None,
-            'ad_hoc': data.get('ad_hoc', False)
+            'ad_hoc': ad_hoc
         }
         
         app.logger.info(f"Started session {session_id} in {classroom} for {subject}")
@@ -499,7 +502,7 @@ def end_session():
                 
                 if session_start <= checkin_time <= session_end:
                     date_str = session_start.date().isoformat()
-                    session_key = f"{server.sessions[session_id]['subject']}_{session_id}"
+                    session_key = f"{session_id}"
                     
                     if date_str not in server.students[student_id]['attendance']:
                         server.students[student_id]['attendance'][date_str] = {}
@@ -524,20 +527,6 @@ def end_session():
         app.logger.info(f"Ended session {session_id}")
         return jsonify({'message': 'Session ended successfully'}), 200
 
-@app.route('/teacher/get_sessions', methods=['GET'])
-def get_sessions():
-    teacher_id = request.args.get('teacher_id')
-    classroom = request.args.get('classroom')
-    
-    filtered = list(server.sessions.values())
-    
-    if teacher_id:
-        filtered = [s for s in filtered if s['teacher_id'] == teacher_id]
-    if classroom:
-        filtered = [s for s in filtered if s['classroom'] == classroom]
-    
-    return jsonify({'sessions': filtered}), 200
-
 @app.route('/teacher/get_active_sessions', methods=['GET'])
 def get_active_sessions():
     teacher_id = request.args.get('teacher_id')
@@ -550,30 +539,6 @@ def get_active_sessions():
                     active_sessions.append(session)
     
     return jsonify({'sessions': active_sessions}), 200
-
-@app.route('/teacher/set_bssid', methods=['POST'])
-def set_bssid():
-    data = request.json
-    bssid = data.get('bssid')
-    
-    if not bssid:
-        return jsonify({'error': 'BSSID is required'}), 400
-    
-    # Normalize BSSID to uppercase
-    bssid = bssid.upper()
-    
-    # Update all teachers' BSSID mappings for their classrooms
-    with server.lock:
-        for teacher in server.teachers.values():
-            for classroom in teacher['classrooms']:
-                teacher['bssid_mapping'][classroom] = bssid
-        
-        # Update all student checkins to force refresh
-        for student_id in server.student_checkins:
-            server.student_checkins[student_id]['bssid_updated'] = True
-    
-    app.logger.info(f"Global authorized BSSID set to: {bssid}")
-    return jsonify({'message': 'Authorized BSSID set successfully'}), 200
 
 @app.route('/teacher/get_status', methods=['GET'])
 def get_status():
@@ -692,22 +657,21 @@ def random_ring():
 
 @app.route('/teacher/get_special_dates', methods=['GET'])
 def get_special_dates():
-    return jsonify({
-        'holidays': server.holidays,
-        'special_dates': server.special_dates
-    }), 200
+    return jsonify(server.special_dates), 200
 
 @app.route('/teacher/update_special_dates', methods=['POST'])
 def update_special_dates():
     data = request.json
     holidays = data.get('holidays', [])
-    special_dates = data.get('special_dates', [])
+    special_schedules = data.get('special_schedules', [])
     
     with server.lock:
-        server.holidays = holidays
-        server.special_dates = special_dates
+        server.special_dates = {
+            "holidays": holidays,
+            "special_schedules": special_schedules
+        }
     
-    app.logger.info(f"Updated special dates: {len(holidays)} holidays, {len(special_dates)} special dates")
+    app.logger.info(f"Updated special dates: {len(holidays)} holidays, {len(special_schedules)} special schedules")
     return jsonify({'message': 'Special dates updated successfully'}), 200
 
 @app.route('/teacher/get_timetable', methods=['GET'])
