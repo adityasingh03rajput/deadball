@@ -1,479 +1,316 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
------------------------------------------------------------------------------
-                              Attendance Server
------------------------------------------------------------------------------
-
-A comprehensive Flask-based backend for a real-time attendance management system.
-
-Features:
-- Dual user roles: Teacher and Student, with a special 'admin' teacher role.
-- Real-time attendance tracking using a timer-based system initiated by
-  BSSID (WiFi access point) check-ins.
-- Session management for classes (standard and ad-hoc).
-- Full CRUD (Create, Read, Update, Delete) operations for students and teachers.
-- Timetable and special dates (holidays) management.
-- Detailed attendance reporting and analytics.
-- Background threads for continuous timer updates and data cleanup.
-- Robust error handling and logging.
-- Secure password hashing and a token-based password reset mechanism.
-- Structured with a service layer to separate business logic from API endpoints.
-
-Architecture:
-- Web Framework: Flask
-- Database: PostgreSQL (via psycopg2)
-- Concurrency: Python's threading module for background tasks.
-- Dependencies: Flask, Flask-CORS, Werkzeug, psycopg2-binary.
-
-Setup:
-1.  Set up a PostgreSQL database.
-2.  Set the DATABASE_URL environment variable:
-    export DATABASE_URL="postgresql://user:password@host:port/dbname"
-3.  Install dependencies:
-    pip install Flask Flask-CORS Werkzeug psycopg2-binary
-4.  Run the server:
-    python your_script_name.py
-
-The server will initialize the database schema on its first run and create a
-default 'admin' user with the password 'admin'.
-"""
-
-# --- Standard Library Imports ---
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from datetime import datetime, timedelta
+import threading
+import time
+import random
+from werkzeug.security import generate_password_hash, check_password_hash
+import uuid
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import signal
 import atexit
-import threading
-import time
-import uuid
-import json
-import logging
-from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
-from contextlib import contextmanager
-
-# --- Third-Party Imports ---
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from werkzeug.security import generate_password_hash, check_password_hash
 import psycopg2
 import psycopg2.extras
+import json
+from contextlib import contextmanager
 
-# -----------------------------------------------------------------------------
-# --- Application Configuration & Initialization ---
-# -----------------------------------------------------------------------------
-
-# Initialize Flask App and enable Cross-Origin Resource Sharing
 app = Flask(__name__)
 CORS(app)
 
-# --- Logging Configuration ---
-# Configure logging to write to a rotating file and the console.
-# This ensures that logs are persistent and don't grow indefinitely.
-def setup_logging():
-    """Configures the application's logger."""
-    log_dir = 'logs'
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-    
-    # Configure root logger to show INFO level messages
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
-    # Create a specific logger for this application
-    logger = logging.getLogger('AttendanceServer')
-    logger.setLevel(logging.INFO) # Set specific level for this logger
-    
-    # Create a file handler which logs even debug messages
-    handler = RotatingFileHandler(
-        os.path.join(log_dir, 'attendance.log'), 
-        maxBytes=1000000, 
-        backupCount=5
-    )
-    handler.setLevel(logging.INFO)
-    
-    # Create a logging format
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(threadName)s] - %(message)s')
-    handler.setFormatter(formatter)
-    
-    # Add the handler to the logger
-    if not logger.handlers:
-        logger.addHandler(handler)
-        
-    return logger
-
-logger = setup_logging()
-
-
-# -----------------------------------------------------------------------------
-# --- Database Management ---
-# -----------------------------------------------------------------------------
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('AttendanceServer')
+handler = RotatingFileHandler('attendance.log', maxBytes=1000000, backupCount=5)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 class DatabaseManager:
-    """
-    Manages all interactions with the PostgreSQL database.
-
-    This class abstracts the database connection logic, schema initialization,
-    and query execution. It uses a connection context manager to ensure
-    that connections are properly opened and closed.
-    """
     def __init__(self, db_url=None):
-        """
-        Initializes the DatabaseManager.
-
-        Args:
-            db_url (str, optional): The PostgreSQL connection URL. If not provided,
-                                    it's read from the 'DATABASE_URL' environment variable.
-        
-        Raises:
-            ValueError: If the DATABASE_URL is not set.
-        """
         self.db_url = db_url or os.getenv('DATABASE_URL')
-        if not self.db_url:
-            logger.critical("FATAL: DATABASE_URL environment variable not set.")
-            raise ValueError("DATABASE_URL environment variable not set.")
         self._init_db()
+
+    def _init_db(self):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # Teachers table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS teachers (
+                    id TEXT PRIMARY KEY,
+                    password TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    classrooms TEXT,
+                    bssid_mapping TEXT,
+                    branches TEXT,
+                    semesters TEXT
+                )
+            ''')
+            # Students table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS students (
+                    id TEXT PRIMARY KEY,
+                    password TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    classroom TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    semester INTEGER NOT NULL,
+                    attendance TEXT
+                )
+            ''')
+            # Sessions table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    teacher_id TEXT NOT NULL,
+                    classroom TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    branch TEXT,
+                    semester INTEGER,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT,
+                    ad_hoc INTEGER DEFAULT 0,
+                    FOREIGN KEY (teacher_id) REFERENCES teachers (id)
+                )
+            ''')
+            # Checkins table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS checkins (
+                    student_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    bssid TEXT,
+                    device_id TEXT NOT NULL,
+                    PRIMARY KEY (student_id, device_id),
+                    FOREIGN KEY (student_id) REFERENCES students (id)
+                )
+            ''')
+            # Timers table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS timers (
+                    student_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    start_time DOUBLE PRECISION,
+                    duration INTEGER NOT NULL,
+                    remaining INTEGER NOT NULL,
+                    FOREIGN KEY (student_id) REFERENCES students (id)
+                )
+            ''')
+            # Active devices table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS active_devices (
+                    student_id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    last_activity TEXT NOT NULL,
+                    FOREIGN KEY (student_id) REFERENCES students (id)
+                )
+            ''')
+            # Manual overrides table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS manual_overrides (
+                    student_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    FOREIGN KEY (student_id) REFERENCES students (id)
+                )
+            ''')
+            # Timetables table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS timetables (
+                    branch TEXT NOT NULL,
+                    semester INTEGER NOT NULL,
+                    timetable TEXT NOT NULL,
+                    PRIMARY KEY (branch, semester)
+                )
+            ''')
+            # Special dates table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS special_dates (
+                    id SERIAL PRIMARY KEY,
+                    holidays TEXT NOT NULL,
+                    special_schedules TEXT NOT NULL
+                )
+            ''')
+            # Server settings table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS server_settings (
+                    id SERIAL PRIMARY KEY,
+                    authorized_bssid TEXT,
+                    checkin_interval INTEGER NOT NULL,
+                    timer_duration INTEGER NOT NULL
+                )
+            ''')
+            cursor.execute('SELECT 1 FROM server_settings LIMIT 1')
+            if not cursor.fetchone():
+                cursor.execute('INSERT INTO server_settings (authorized_bssid, checkin_interval, timer_duration) VALUES (%s, %s, %s)', (None, 60, 1800))
+            conn.commit()
 
     @contextmanager
     def _get_connection(self):
-        """
-        Provides a database connection within a Python `with` statement.
-        
-        This method handles the opening and closing of the database connection,
-        ensuring resources are managed correctly. It uses RealDictCursor to
-        return query results as dictionaries.
-
-        Yields:
-            psycopg2.connection: The database connection object.
-        
-        Raises:
-            psycopg2.Error: If a connection to the database cannot be established.
-        """
-        conn = None
+        conn = psycopg2.connect(self.db_url, cursor_factory=psycopg2.extras.RealDictCursor)
         try:
-            conn = psycopg2.connect(self.db_url, cursor_factory=psycopg2.extras.RealDictCursor)
             yield conn
-        except psycopg2.Error as e:
-            logger.error(f"Database connection error: {e}")
-            raise
         finally:
-            if conn:
-                conn.close()
-
-    def _init_db(self):
-        """
-        Initializes the database schema. Creates all necessary tables if they
-        do not already exist. This method is idempotent.
-        """
-        schema_queries = [
-            '''
-            CREATE TABLE IF NOT EXISTS teachers (
-                id TEXT PRIMARY KEY,
-                password TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                name TEXT NOT NULL,
-                classrooms TEXT,
-                bssid_mapping TEXT,
-                branches TEXT,
-                semesters TEXT
-            )
-            ''',
-            '''
-            CREATE TABLE IF NOT EXISTS students (
-                id TEXT PRIMARY KEY,
-                password TEXT NOT NULL,
-                name TEXT NOT NULL,
-                classroom TEXT NOT NULL,
-                branch TEXT NOT NULL,
-                semester INTEGER NOT NULL,
-                attendance TEXT
-            )
-            ''',
-            '''
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                teacher_id TEXT NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
-                classroom TEXT NOT NULL,
-                subject TEXT NOT NULL,
-                branch TEXT,
-                semester INTEGER,
-                start_time TEXT NOT NULL,
-                end_time TEXT,
-                ad_hoc INTEGER DEFAULT 0
-            )
-            ''',
-            '''
-            CREATE TABLE IF NOT EXISTS checkins (
-                student_id TEXT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-                timestamp TEXT NOT NULL,
-                bssid TEXT,
-                device_id TEXT NOT NULL,
-                PRIMARY KEY (student_id, device_id)
-            )
-            ''',
-            '''
-            CREATE TABLE IF NOT EXISTS timers (
-                student_id TEXT PRIMARY KEY REFERENCES students(id) ON DELETE CASCADE,
-                status TEXT NOT NULL,
-                start_time DOUBLE PRECISION,
-                duration INTEGER NOT NULL,
-                remaining INTEGER NOT NULL
-            )
-            ''',
-            '''
-            CREATE TABLE IF NOT EXISTS active_devices (
-                student_id TEXT PRIMARY KEY REFERENCES students(id) ON DELETE CASCADE,
-                device_id TEXT NOT NULL,
-                last_activity TEXT NOT NULL
-            )
-            ''',
-            '''
-            CREATE TABLE IF NOT EXISTS manual_overrides (
-                student_id TEXT PRIMARY KEY REFERENCES students(id) ON DELETE CASCADE,
-                status TEXT NOT NULL
-            )
-            ''',
-            '''
-            CREATE TABLE IF NOT EXISTS timetables (
-                branch TEXT NOT NULL,
-                semester INTEGER NOT NULL,
-                timetable TEXT NOT NULL,
-                PRIMARY KEY (branch, semester)
-            )
-            ''',
-            '''
-            CREATE TABLE IF NOT EXISTS special_dates (
-                id SERIAL PRIMARY KEY,
-                holidays TEXT NOT NULL,
-                special_schedules TEXT NOT NULL
-            )
-            ''',
-            '''
-            CREATE TABLE IF NOT EXISTS server_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            ''',
-            '''
-            CREATE TABLE IF NOT EXISTS password_reset_tokens (
-                email TEXT PRIMARY KEY,
-                token TEXT NOT NULL,
-                expires_at TIMESTAMP NOT NULL
-            )
-            '''
-        ]
-        
-        try:
-            with self._get_connection() as conn:
-                with conn.cursor() as cursor:
-                    for query in schema_queries:
-                        cursor.execute(query)
-                    
-                    # Seed default settings if they don't exist using UPSERT
-                    default_settings = {
-                        'authorized_bssid': None,
-                        'checkin_interval': '60',
-                        'timer_duration': '1800'
-                    }
-                    for key, value in default_settings.items():
-                        cursor.execute(
-                            'INSERT INTO server_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING',
-                            (key, value)
-                        )
-                    
-                    conn.commit()
-            logger.info("Database schema initialized successfully.")
-        except psycopg2.Error as e:
-            logger.critical(f"Failed to initialize database schema: {e}")
-            raise
+            conn.close()
 
     def execute(self, query, params=(), commit=False):
-        """
-        Executes a query (e.g., INSERT, UPDATE, DELETE).
-
-        Args:
-            query (str): The SQL query string with placeholders (%s).
-            params (tuple, optional): A tuple of parameters to substitute into the query.
-            commit (bool, optional): If True, the transaction is committed. Defaults to False.
-        
-        Returns:
-            psycopg2.cursor: The cursor object after execution.
-        """
         with self._get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query, params)
-                if commit:
-                    conn.commit()
-                return cursor
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            if commit:
+                conn.commit()
+            return cursor
 
     def fetch_one(self, query, params=()):
-        """
-        Executes a query and fetches the first result.
-
-        Args:
-            query (str): The SQL query string.
-            params (tuple, optional): Parameters for the query.
-        
-        Returns:
-            dict or None: A dictionary representing the row, or None if no result is found.
-        """
         with self._get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query, params)
-                return cursor.fetchone()
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            return cursor.fetchone()
 
     def fetch_all(self, query, params=()):
-        """
-        Executes a query and fetches all results.
-
-        Args:
-            query (str): The SQL query string.
-            params (tuple, optional): Parameters for the query.
-        
-        Returns:
-            list[dict]: A list of dictionaries, where each dictionary is a row.
-        """
         with self._get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query, params)
-                return cursor.fetchall()
-    
-    def get_setting(self, key):
-        """
-        Retrieves a specific setting from the server_settings table.
-
-        Args:
-            key (str): The key of the setting to retrieve.
-
-        Returns:
-            str or None: The value of the setting, or None if not found.
-        """
-        row = self.fetch_one("SELECT value FROM server_settings WHERE key = %s", (key,))
-        return row['value'] if row else None
-        
-# -----------------------------------------------------------------------------
-# --- Core Server Logic & Background Tasks ---
-# -----------------------------------------------------------------------------
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            return cursor.fetchall()
 
 class AttendanceServer:
-    """
-    The main class for the Attendance Server application.
-
-    This class encapsulates all the core business logic, manages server state,
-    and runs background threads for periodic tasks like updating timers and
-    cleaning up old data. It is the central orchestrator of the application.
-    """
     def __init__(self):
-        """
-        Initializes the AttendanceServer instance.
-        """
         self.db = DatabaseManager()
         self.lock = threading.Lock()
         self.running = True
         
-        # Load server settings from DB into memory
-        self.CHECKIN_INTERVAL = int(self.db.get_setting('checkin_interval') or 60)
-        self.TIMER_DURATION = int(self.db.get_setting('timer_duration') or 1800)
+        # Load server settings
+        settings = self.db.fetch_one('SELECT * FROM server_settings')
+        self.CHECKIN_INTERVAL = settings['checkin_interval']
+        self.TIMER_DURATION = settings['timer_duration']
         self.SERVER_PORT = int(os.getenv('PORT', 5000))
         
-        # Ensure a default admin account exists
-        self._create_admin_account_if_not_exists()
+        # Initialize with admin if not exists
+        if not self.db.fetch_one('SELECT 1 FROM teachers WHERE id = %s', ('admin',)):
+            self._create_admin_account()
         
-        # Start background maintenance threads
+        # Start background threads
         self.start_background_threads()
     
-    def _create_admin_account_if_not_exists(self):
-        """
-        Checks for the existence of an 'admin' user and creates one with
-        sample data if it's not found. This is useful for initial setup.
-        """
-        with self.lock:
-            if not self.db.fetch_one('SELECT 1 FROM teachers WHERE id = %s', ('admin',)):
-                logger.info("Admin account not found. Creating default admin user.")
-                self.db.execute(
-                    'INSERT INTO teachers (id, password, email, name, classrooms, bssid_mapping, branches, semesters) '
-                    'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
-                    (
-                        'admin', generate_password_hash('admin'), 'admin@school.com', 'Admin',
-                        json.dumps(["A101", "A102", "B201", "B202"]),
-                        json.dumps({"A101": "00:11:22:33:44:55", "A102": "AA:BB:CC:DD:EE:FF"}),
-                        json.dumps(["CSE", "ECE", "EEE", "ME", "CE"]),
-                        json.dumps(list(range(1, 9)))
-                    ), commit=True
-                )
-                logger.info("Default 'admin' account created with password 'admin'.")
+    def _create_admin_account(self):
+        self.db.execute(
+            'INSERT INTO teachers (id, password, email, name, classrooms, bssid_mapping, branches, semesters) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
+            (
+                'admin',
+                generate_password_hash('admin'),
+                'admin@school.com',
+                'Admin',
+                json.dumps(["A101", "A102", "B201", "B202"]),
+                json.dumps({"A101": "00:11:22:33:44:55", "A102": "AA:BB:CC:DD:EE:FF"}),
+                json.dumps(["CSE", "ECE", "EEE", "ME", "CE"]),
+                json.dumps(list(range(1, 9)))
+            ),
+            commit=True
+        )
+        
+        # Create sample students if none exist
+        if not self.db.fetch_one('SELECT 1 FROM students LIMIT 1'):
+            self.db.execute(
+                'INSERT INTO students (id, password, name, classroom, branch, semester, attendance) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s)',
+                (
+                    's001',
+                    generate_password_hash('student123'),
+                    'John Doe',
+                    'A101',
+                    'CSE',
+                    3,
+                    json.dumps({})
+                ),
+                commit=True
+            )
+            self.db.execute(
+                'INSERT INTO students (id, password, name, classroom, branch, semester, attendance) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s)',
+                (
+                    's002',
+                    generate_password_hash('student123'),
+                    'Jane Smith',
+                    'A101',
+                    'CSE',
+                    3,
+                    json.dumps({})
+                ),
+                commit=True
+            )
+            
+            # Create sample timetable
+            self.db.execute(
+                'INSERT INTO timetables (branch, semester, timetable) VALUES (%s, %s, %s)',
+                (
+                    'CSE',
+                    3,
+                    json.dumps([
+                        ["Monday", "09:00", "10:00", "Mathematics", "A101"],
+                        ["Monday", "10:00", "11:00", "Physics", "A101"]
+                    ])
+                ),
+                commit=True
+            )
     
     def start_background_threads(self):
-        """
-        Initializes and starts all background threads for the server.
-        These threads run tasks like updating timers and cleaning up old data.
-        They are set as daemons so they exit when the main program exits.
-        """
-        threads = {
-            "TimerUpdater": self.update_timers,
-            "CheckinCleaner": self.cleanup_checkins,
-            "DeviceCleaner": self.cleanup_active_devices
-        }
-        for name, target in threads.items():
-            thread = threading.Thread(target=target, name=name, daemon=True)
-            thread.start()
-        logger.info(f"Started {len(threads)} background threads.")
+        """Start all background maintenance threads"""
+        timer_thread = threading.Thread(target=self.update_timers, daemon=True)
+        timer_thread.start()
+        
+        cleanup_thread = threading.Thread(target=self.cleanup_checkins, daemon=True)
+        cleanup_thread.start()
+        
+        device_cleanup_thread = threading.Thread(target=self.cleanup_active_devices, daemon=True)
+        device_cleanup_thread.start()
     
     def update_timers(self):
-        """
-        [Background Thread]
-        Continuously updates all 'running' student timers every second.
-        If a timer completes, it marks it as 'completed' and triggers
-        the attendance recording logic.
-        """
+        """Background thread to update all student timers"""
         while self.running:
-            try:
-                with self.lock:
-                    current_time = datetime.now().timestamp()
-                    running_timers = self.db.fetch_all('SELECT * FROM timers WHERE status = %s', ('running',))
+            current_time = datetime.now().timestamp()
+            
+            with self.lock:
+                timers = self.db.fetch_all('SELECT * FROM timers WHERE status = %s', ('running',))
+                for timer in timers:
+                    elapsed = current_time - timer['start_time']
+                    remaining = max(0, timer['duration'] - elapsed)
                     
-                    for timer in running_timers:
-                        elapsed = current_time - timer['start_time']
-                        remaining = max(0, int(timer['duration'] - elapsed))
-                        
-                        if remaining <= 0:
-                            self.db.execute(
-                                'UPDATE timers SET status = %s, remaining = 0 WHERE student_id = %s',
-                                ('completed', timer['student_id']), commit=True
-                            )
-                            # Call the method to record attendance for the completed timer
-                            self._record_timer_attendance(timer['student_id'])
-                        else:
-                            self.db.execute(
-                                'UPDATE timers SET remaining = %s WHERE student_id = %s',
-                                (remaining, timer['student_id']), commit=True
-                            )
-            except Exception as e:
-                logger.error(f"Error in update_timers thread: {e}", exc_info=True)
-            time.sleep(1) # Run every second
+                    if remaining <= 0:
+                        self.db.execute(
+                            'UPDATE timers SET status = %s, remaining = %s WHERE student_id = %s',
+                            ('completed', 0, timer['student_id']),
+                            commit=True
+                        )
+                        self.record_attendance(timer['student_id'])
+                    else:
+                        self.db.execute(
+                            'UPDATE timers SET remaining = %s WHERE student_id = %s',
+                            (remaining, timer['student_id']),
+                            commit=True
+                        )
+            
+            time.sleep(1)
     
-    def _record_timer_attendance(self, student_id):
-        """
-        Records attendance for a student whose timer has just completed.
-        This is an internal method called by the `update_timers` thread.
-
-        Args:
-            student_id (str): The ID of the student.
-        """
+    def record_attendance(self, student_id):
+        """Record attendance for completed timer"""
         with self.lock:
             student = self.db.fetch_one('SELECT * FROM students WHERE id = %s', (student_id,))
             if not student:
-                logger.warning(f"Attempted to record attendance for non-existent student {student_id}")
                 return
-
+            
             timer = self.db.fetch_one('SELECT * FROM timers WHERE student_id = %s', (student_id,))
             if not timer or timer['status'] != 'completed':
                 return
-
-            # Determine authorization based on the last checkin's BSSID
-            checkin = self.db.fetch_one('SELECT bssid FROM checkins WHERE student_id = %s ORDER BY timestamp DESC LIMIT 1', (student_id,))
-            authorized_bssid = self.db.get_setting('authorized_bssid')
-            is_authorized = checkin and authorized_bssid and checkin['bssid'] == authorized_bssid
+            
+            # Check authorization
+            checkin = self.db.fetch_one(
+                'SELECT * FROM checkins WHERE student_id = %s ORDER BY timestamp DESC LIMIT 1',
+                (student_id,)
+            )
+            
+            authorized_bssid = self.db.fetch_one('SELECT authorized_bssid FROM server_settings')['authorized_bssid']
+            is_authorized = checkin and checkin['bssid'] == authorized_bssid
             
             date_str = datetime.fromtimestamp(timer['start_time']).date().isoformat()
             session_key = f"timer_{int(timer['start_time'])}"
@@ -483,761 +320,1244 @@ class AttendanceServer:
                 attendance[date_str] = {}
             
             attendance[date_str][session_key] = {
-                'status': 'present' if is_authorized else 'absent_unauthorized_loc',
-                'subject': 'Automated Session',
+                'status': 'present' if is_authorized else 'absent',
+                'subject': 'Timer Session',
                 'classroom': student['classroom'],
                 'start_time': datetime.fromtimestamp(timer['start_time']).isoformat(),
                 'end_time': datetime.fromtimestamp(timer['start_time'] + self.TIMER_DURATION).isoformat(),
                 'branch': student['branch'],
-                'semester': student['semester'],
-                'recorded_by': 'timer'
+                'semester': student['semester']
             }
             
             self.db.execute(
                 'UPDATE students SET attendance = %s WHERE id = %s',
-                (json.dumps(attendance), student_id), commit=True
+                (json.dumps(attendance), student_id),
+                commit=True
             )
-            logger.info(f"Recorded {'present' if is_authorized else 'absent'} attendance for student {student_id} from completed timer.")
     
     def cleanup_checkins(self):
-        """
-        [Background Thread]
-        Periodically removes old check-in records from the database to prevent
-        the `checkins` table from growing indefinitely.
-        """
+        """Background thread to clean up old checkins"""
         while self.running:
-            time.sleep(3600) # Run every hour
-            try:
-                threshold = (datetime.now() - timedelta(days=1)).isoformat()
-                with self.lock:
-                    result = self.db.execute('DELETE FROM checkins WHERE timestamp < %s', (threshold,), commit=True)
-                    logger.info(f"Cleaned up {result.rowcount} old check-in records.")
-            except Exception as e:
-                logger.error(f"Error in cleanup_checkins thread: {e}", exc_info=True)
-
-    def cleanup_active_devices(self):
-        """
-        [Background Thread]
-        Periodically removes inactive device sessions. If a student's device
-        hasn't pinged the server in a while, their session data (active_device,
-        checkin, timer) is cleared to allow them to log in again.
-        """
-        while self.running:
-            time.sleep(300) # Run every 5 minutes
-            try:
-                # Inactivity threshold of 15 minutes
-                threshold = (datetime.now() - timedelta(minutes=15)).isoformat()
-                with self.lock:
-                    inactive_devices = self.db.fetch_all('SELECT student_id FROM active_devices WHERE last_activity < %s', (threshold,))
-                    
-                    if not inactive_devices:
-                        continue
-                        
-                    student_ids = tuple(d['student_id'] for d in inactive_devices)
-                    placeholders = ', '.join(['%s'] * len(student_ids))
-                    
-                    # Use a single transaction for all deletions
-                    with self.db._get_connection() as conn:
-                        with conn.cursor() as cursor:
-                            cursor.execute(f'DELETE FROM active_devices WHERE student_id IN ({placeholders})', student_ids)
-                            cursor.execute(f'DELETE FROM checkins WHERE student_id IN ({placeholders})', student_ids)
-                            cursor.execute(f'DELETE FROM timers WHERE student_id IN ({placeholders})', student_ids)
-                        conn.commit()
-                    
-                    logger.info(f"Cleaned up {len(student_ids)} inactive device sessions for students: {student_ids}")
-            except Exception as e:
-                logger.error(f"Error in cleanup_active_devices thread: {e}", exc_info=True)
+            threshold = (datetime.now() - timedelta(minutes=10)).isoformat()
+            
+            with self.lock:
+                self.db.execute(
+                    'DELETE FROM checkins WHERE timestamp < %s',
+                    (threshold,),
+                    commit=True
+                )
+            
+            time.sleep(60)
     
-    def start_timer_for_student(self, student_id):
-        """
-        Starts or resets an attendance timer for a specific student.
-
-        Args:
-            student_id (str): The ID of the student.
-
-        Returns:
-            bool: True if the timer was started successfully, False otherwise.
-        """
+    def cleanup_active_devices(self):
+        """Background thread to clean up inactive devices"""
+        while self.running:
+            threshold = (datetime.now() - timedelta(minutes=5)).isoformat()
+            
+            with self.lock:
+                inactive_devices = self.db.fetch_all(
+                    'SELECT student_id FROM active_devices WHERE last_activity < %s',
+                    (threshold,)
+                )
+                
+                for device in inactive_devices:
+                    student_id = device['student_id']
+                    self.db.execute(
+                        'DELETE FROM active_devices WHERE student_id = %s',
+                        (student_id,),
+                        commit=True
+                    )
+                    self.db.execute(
+                        'DELETE FROM checkins WHERE student_id = %s',
+                        (student_id,),
+                        commit=True
+                    )
+                    self.db.execute(
+                        'DELETE FROM timers WHERE student_id = %s',
+                        (student_id,),
+                        commit=True
+                    )
+            
+            time.sleep(60)
+    
+    def start_timer(self, student_id):
+        """Start timer for a student"""
         with self.lock:
             if not self.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
                 return False
             
-            current_timestamp = datetime.now().timestamp()
-            # Use UPSERT logic for cleaner code
-            self.db.execute(
-                """
-                INSERT INTO timers (student_id, status, start_time, duration, remaining)
-                VALUES (%s, 'running', %s, %s, %s)
-                ON CONFLICT (student_id) DO UPDATE SET
-                    status = 'running',
-                    start_time = EXCLUDED.start_time,
-                    duration = EXCLUDED.duration,
-                    remaining = EXCLUDED.remaining
-                """,
-                (student_id, current_timestamp, self.TIMER_DURATION, self.TIMER_DURATION),
-                commit=True
-            )
-            logger.info(f"Timer started/reset for student {student_id}.")
+            existing_timer = self.db.fetch_one('SELECT 1 FROM timers WHERE student_id = %s', (student_id,))
+            if existing_timer:
+                self.db.execute(
+                    'UPDATE timers SET status = %s, start_time = %s, duration = %s, remaining = %s WHERE student_id = %s',
+                    ('running', datetime.now().timestamp(), self.TIMER_DURATION, self.TIMER_DURATION, student_id),
+                    commit=True
+                )
+            else:
+                self.db.execute(
+                    'INSERT INTO timers (student_id, status, start_time, duration, remaining) VALUES (%s, %s, %s, %s, %s)',
+                    (student_id, 'running', datetime.now().timestamp(), self.TIMER_DURATION, self.TIMER_DURATION),
+                    commit=True
+                )
+            
             return True
 
+# Initialize the server
+server = AttendanceServer()
 
-# -----------------------------------------------------------------------------
-# --- Service Layer ---
-# -----------------------------------------------------------------------------
-# This layer contains the core business logic. Flask routes will call these
-# methods, keeping the routes themselves thin and focused on handling
-# HTTP requests and responses.
-
-class TeacherService:
-    """
-    Service class for handling teacher-related business logic.
-    """
-    def __init__(self, db_manager):
-        self.db = db_manager
-
-    def login(self, teacher_id, password):
-        """
-        Authenticates a teacher.
-
-        Args:
-            teacher_id (str): The teacher's ID.
-            password (str): The teacher's password.
-
-        Returns:
-            dict or None: The teacher's data if login is successful, otherwise None.
-        """
-        teacher = self.db.fetch_one('SELECT * FROM teachers WHERE id = %s', (teacher_id,))
-        if teacher and check_password_hash(teacher['password'], password):
-            # Decode JSON fields for the response
-            for key in ['classrooms', 'bssid_mapping', 'branches', 'semesters']:
-                if teacher[key]:
-                    try:
-                        teacher[key] = json.loads(teacher[key])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning(f"Could not decode JSON for key '{key}' for teacher '{teacher_id}'")
-                        teacher[key] = {} if key == 'bssid_mapping' else []
-                else:
-                    teacher[key] = {} if key == 'bssid_mapping' else []
-            return teacher
-        return None
-
-# We would create more services like StudentService, AdminService, SessionService, etc.
-# For brevity in this combined file, we'll keep the logic in the endpoints
-# but acknowledge this would be the next refactoring step.
-
-
-# -----------------------------------------------------------------------------
-# --- Server and Service Initialization ---
-# -----------------------------------------------------------------------------
-try:
-    server = AttendanceServer()
-    teacher_service = TeacherService(server.db)
-except Exception as e:
-    logger.critical(f"CRITICAL: Failed to initialize server components: {e}", exc_info=True)
-    # In a real app, this might trigger an alert and exit.
-    exit(1)
-
-
-# -----------------------------------------------------------------------------
-# --- Graceful Shutdown ---
-# -----------------------------------------------------------------------------
-def cleanup_on_shutdown():
-    """
-    Performs cleanup operations when the server is shutting down.
-    This function is registered with `atexit` and signal handlers.
-    """
+# Cleanup on exit
+def cleanup():
     server.running = False
-    logger.info("Shutdown signal received. Stopping background threads...")
-    # Give background threads a moment to finish their current loop
-    time.sleep(2)
-    logger.info("Server has shut down gracefully.")
+    logger.info("Server shutting down...")
 
-# Register the cleanup function to be called on script exit
-atexit.register(cleanup_on_shutdown)
-# Register for system signals for a graceful shutdown
-signal.signal(signal.SIGINT, lambda s, f: exit(0))
-signal.signal(signal.SIGTERM, lambda s, f: exit(0))
+atexit.register(cleanup)
+signal.signal(signal.SIGTERM, lambda signum, frame: cleanup())
 
-
-# -----------------------------------------------------------------------------
-# --- Custom Error Handling ---
-# -----------------------------------------------------------------------------
-class ApiError(Exception):
-    """Custom exception class for API errors."""
-    status_code = 400
-    def __init__(self, message, status_code=None, payload=None):
-        super().__init__()
-        self.message = message
-        if status_code is not None:
-            self.status_code = status_code
-        self.payload = payload
-
-    def to_dict(self):
-        rv = dict(self.payload or ())
-        rv['error'] = self.message
-        return rv
-
-@app.errorhandler(ApiError)
-def handle_api_error(error):
-    """Catches custom API errors and returns a JSON response."""
-    response = jsonify(error.to_dict())
-    response.status_code = error.status_code
-    logger.warning(f"API Error ({error.status_code}): {error.message}")
-    return response
-
-@app.errorhandler(404)
-def not_found_error(error):
-    """Handles 404 Not Found errors."""
-    return jsonify({'error': 'Resource not found'}), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    """Handles 500 Internal Server errors."""
-    logger.error(f"Internal Server Error: {error}", exc_info=True)
-    return jsonify({'error': 'An unexpected internal server error occurred'}), 500
-
-@app.errorhandler(400)
-def bad_request_error(error):
-    """Handles 400 Bad Request errors."""
-    return jsonify({'error': 'Bad request. Please check your input.'}), 400
-
-
-# -----------------------------------------------------------------------------
-# --- Helper Functions and Decorators ---
-# -----------------------------------------------------------------------------
-
-def admin_required(f):
-    """
-    A decorator to protect routes that require admin privileges.
-    It checks if the provided teacher_id is 'admin'.
-    In a real app, this would check a role from a JWT.
-    """
-    from functools import wraps
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        # In a JWT-based system, you'd get the role from the token.
-        # Here, we simulate it by checking a request parameter.
-        teacher_id = request.args.get('teacher_id') or (request.is_json and request.get_json().get('teacher_id'))
-        if teacher_id != 'admin':
-            raise ApiError('Admin privileges required', 403)
-        return f(*args, **kwargs)
-    return decorated_function
-
-
-# -----------------------------------------------------------------------------
-# --- API Endpoints ---
-# -----------------------------------------------------------------------------
-# Endpoints are organized by user role/feature for clarity.
-# -----------------------------------------------------------------------------
-
-# =============================================================================
-# --- Authentication Endpoints ---
-# =============================================================================
+# Teacher endpoints
+@app.route('/teacher/signup', methods=['POST'])
+def teacher_signup():
+    data = request.json
+    teacher_id = data.get('id')
+    password = data.get('password')
+    email = data.get('email')
+    name = data.get('name')
+    
+    if not all([teacher_id, password, email, name]):
+        return jsonify({'error': 'All fields are required'}), 400
+    
+    with server.lock:
+        if server.db.fetch_one('SELECT 1 FROM teachers WHERE id = %s', (teacher_id,)):
+            return jsonify({'error': 'Teacher ID already exists'}), 400
+        if server.db.fetch_one('SELECT 1 FROM teachers WHERE email = %s', (email,)):
+            return jsonify({'error': 'Email already registered'}), 400
+        server.db.execute(
+            'INSERT INTO teachers (id, password, email, name, classrooms, bssid_mapping, branches, semesters) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
+            (
+                teacher_id,
+                generate_password_hash(password),
+                email,
+                name,
+                json.dumps([]),
+                json.dumps({}),
+                json.dumps(["CSE", "ECE", "EEE", "ME", "CE"]),
+                json.dumps(list(range(1, 9)))
+            ),
+            commit=True
+        )
+        
+        return jsonify({'message': 'Registration successful'}), 201
 
 @app.route('/teacher/login', methods=['POST'])
 def teacher_login():
-    """
-    Teacher Login Endpoint.
-
-    Authenticates a teacher based on their ID and password.
+    data = request.json
+    teacher_id = data.get('id')
+    password = data.get('password')
     
-    JSON Payload:
-    {
-        "id": "teacher_username",
-        "password": "teacher_password"
-    }
-
-    Returns:
-        On success (200):
-        {
-            "message": "Login successful",
-            "teacher": { ... teacher data ... }
-        }
-        On failure (401):
-        { "error": "Invalid credentials" }
-    """
-    data = request.get_json()
-    if not data or not all(k in data for k in ['id', 'password']):
-        raise ApiError('ID and password are required')
+    if not all([teacher_id, password]):
+        return jsonify({'error': 'ID and password are required'}), 400
     
-    teacher = teacher_service.login(data['id'], data['password'])
+    teacher = server.db.fetch_one('SELECT * FROM teachers WHERE id = %s', (teacher_id,))
     if not teacher:
-        raise ApiError('Invalid credentials', 401)
-        
-    return jsonify({'message': 'Login successful', 'teacher': teacher}), 200
-
-
-@app.route('/student/login', methods=['POST'])
-def student_login():
-    """
-    Student Login Endpoint.
-
-    Authenticates a student and registers their device as active.
-    Prevents login from multiple devices simultaneously.
-
-    JSON Payload:
-    {
-        "id": "student_id",
-        "password": "student_password",
-        "device_id": "unique_device_identifier"
-    }
-
-    Returns:
-        On success (200):
-        {
-            "message": "Login successful",
-            "student": { ... student data ... }
-        }
-    """
-    data = request.get_json()
-    if not data or not all(k in data for k in ['id', 'password', 'device_id']):
-        raise ApiError('ID, password, and device_id are required')
-
-    with server.lock:
-        student = server.db.fetch_one('SELECT * FROM students WHERE id = %s', (data['id'],))
-        if not student or not check_password_hash(student['password'], data['password']):
-            raise ApiError('Invalid credentials', 401)
-        
-        active_device = server.db.fetch_one('SELECT device_id FROM active_devices WHERE student_id = %s', (data['id'],))
-        if active_device and active_device['device_id'] != data['device_id']:
-            raise ApiError('This account is already logged in on another device', 403)
-
-        # UPSERT active device
-        server.db.execute(
-            """
-            INSERT INTO active_devices (student_id, device_id, last_activity) VALUES (%s, %s, %s)
-            ON CONFLICT (student_id) DO UPDATE SET device_id = %s, last_activity = %s
-            """,
-            (data['id'], data['device_id'], datetime.now().isoformat(), data['device_id'], datetime.now().isoformat()),
-            commit=True
-        )
-
-        student_data = {k: student[k] for k in ['id', 'name', 'classroom', 'branch', 'semester']}
-        return jsonify({'message': 'Login successful', 'student': student_data}), 200
-
-
-@app.route('/auth/forgot_password', methods=['POST'])
-def forgot_password():
-    """
-    Forgot Password Endpoint.
-
-    Generates a password reset token for a given email.
-    In a real application, this would also trigger an email to be sent.
-
-    JSON Payload:
-    {
-        "email": "user@school.com"
-    }
-
-    Returns:
-        On success (200):
-        {
-            "message": "If an account with that email exists, a password reset link has been sent."
-        }
-        (The token is also returned for testing purposes)
-    """
-    data = request.get_json()
-    email = data.get('email')
-    if not email:
-        raise ApiError('Email is required')
-
-    # Check if user exists (teacher or student)
-    user = server.db.fetch_one("SELECT id FROM teachers WHERE email = %s", (email,))
-    if not user:
-        # To prevent user enumeration, we always return a success message.
-        logger.info(f"Password reset requested for non-existent email: {email}")
-        return jsonify({"message": "If an account with that email exists, a password reset link has been sent."}), 200
-
-    token = str(uuid.uuid4())
-    expires_at = datetime.now() + timedelta(hours=1)
+        return jsonify({'error': 'Teacher not found'}), 404
     
-    with server.lock:
-        server.db.execute(
-            """
-            INSERT INTO password_reset_tokens (email, token, expires_at) VALUES (%s, %s, %s)
-            ON CONFLICT (email) DO UPDATE SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at
-            """,
-            (email, token, expires_at),
-            commit=True
-        )
-
-    # In a real app, you would email the token to the user.
-    logger.info(f"Password reset token generated for {email}. Token: {token}")
+    if not check_password_hash(teacher['password'], password):
+        return jsonify({'error': 'Incorrect password'}), 401
+    
+    # Convert database row to dict and parse JSON fields
+    teacher_dict = dict(teacher)
+    teacher_dict['classrooms'] = json.loads(teacher_dict['classrooms'])
+    teacher_dict['bssid_mapping'] = json.loads(teacher_dict['bssid_mapping'])
+    teacher_dict['branches'] = json.loads(teacher_dict['branches'])
+    teacher_dict['semesters'] = json.loads(teacher_dict['semesters'])
     
     return jsonify({
-        "message": "If an account with that email exists, a password reset link has been sent.",
-        "reset_token_for_testing": token
+        'message': 'Login successful',
+        'teacher': teacher_dict
     }), 200
 
-
-@app.route('/auth/reset_password', methods=['POST'])
-def reset_password():
-    """
-    Reset Password Endpoint.
-
-    Resets a user's password using a valid token.
-
-    JSON Payload:
-    {
-        "token": "the_reset_token",
-        "new_password": "a_strong_new_password"
-    }
-    """
-    data = request.get_json()
-    token = data.get('token')
-    new_password = data.get('new_password')
-
-    if not token or not new_password:
-        raise ApiError('Token and new password are required')
-
+@app.route('/teacher/register_student', methods=['POST'])
+def register_student():
+    data = request.json
+    student_id = data.get('id')
+    password = data.get('password')
+    name = data.get('name')
+    classroom = data.get('classroom')
+    branch = data.get('branch')
+    semester = data.get('semester')
+    
+    if not all([student_id, password, name, classroom, branch, semester]):
+        return jsonify({'error': 'All fields are required'}), 400
+    
     with server.lock:
-        reset_record = server.db.fetch_one("SELECT * FROM password_reset_tokens WHERE token = %s", (token,))
+        if server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student ID already exists'}), 400
         
-        if not reset_record or reset_record['expires_at'].replace(tzinfo=None) < datetime.now():
-            raise ApiError('Invalid or expired token', 400)
+        server.db.execute(
+            'INSERT INTO students (id, password, name, classroom, branch, semester, attendance) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s)',
+            (
+                student_id,
+                generate_password_hash(password),
+                name,
+                classroom,
+                branch,
+                semester,
+                json.dumps({})
+            ),
+            commit=True
+        )
+        
+        return jsonify({'message': 'Student registered successfully'}), 201
+
+@app.route('/teacher/get_students', methods=['GET'])
+def get_students():
+    classroom = request.args.get('classroom')
+    branch = request.args.get('branch')
+    semester = request.args.get('semester')
+    
+    query = 'SELECT * FROM students'
+    params = []
+    conditions = []
+    
+    if classroom:
+        conditions.append('classroom = %s')
+        params.append(classroom)
+    if branch:
+        conditions.append('branch = %s')
+        params.append(branch)
+    if semester:
+        conditions.append('semester = %s')
+        params.append(semester)
+    
+    if conditions:
+        query += ' WHERE ' + ' AND '.join(conditions)
+    
+    with server.lock:
+        students = server.db.fetch_all(query, params)
+        
+        # Convert to list of dicts and parse attendance
+        students_list = []
+        for student in students:
+            student_dict = dict(student)
+            student_dict['attendance'] = json.loads(student_dict['attendance']) if student_dict['attendance'] else {}
+            students_list.append(student_dict)
+    
+    return jsonify({'students': students_list}), 200
+
+@app.route('/teacher/update_student', methods=['POST'])
+def update_student():
+    data = request.json
+    student_id = data.get('id')
+    new_data = data.get('new_data')
+    
+    if not student_id or not new_data:
+        return jsonify({'error': 'Student ID and new data are required'}), 400
+    
+    with server.lock:
+        if not server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # Build update query
+        set_clauses = []
+        params = []
+        
+        for key, value in new_data.items():
+            if key in ['name', 'classroom', 'branch', 'semester']:
+                set_clauses.append(f'{key} = %s')
+                params.append(value)
+            elif key == 'attendance':
+                set_clauses.append('attendance = %s')
+                params.append(json.dumps(value))
+        
+        if not set_clauses:
+            return jsonify({'error': 'No valid fields to update'}), 400
+        
+        query = f'UPDATE students SET {", ".join(set_clauses)} WHERE id = %s'
+        params.append(student_id)
+        server.db.execute(query, params, commit=True)
+        
+        return jsonify({'message': 'Student updated successfully'}), 200
+
+@app.route('/teacher/delete_student', methods=['POST'])
+def delete_student():
+    data = request.json
+    student_id = data.get('id')
+    
+    if not student_id:
+        return jsonify({'error': 'Student ID is required'}), 400
+    
+    with server.lock:
+        if not server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # Delete all related data
+        server.db.execute('DELETE FROM students WHERE id = %s', (student_id,), commit=True)
+        server.db.execute('DELETE FROM checkins WHERE student_id = %s', (student_id,), commit=True)
+        server.db.execute('DELETE FROM timers WHERE student_id = %s', (student_id,), commit=True)
+        server.db.execute('DELETE FROM active_devices WHERE student_id = %s', (student_id,), commit=True)
+        server.db.execute('DELETE FROM manual_overrides WHERE student_id = %s', (student_id,), commit=True)
+        
+        return jsonify({'message': 'Student deleted successfully'}), 200
+
+@app.route('/teacher/update_profile', methods=['POST'])
+def update_teacher_profile():
+    data = request.json
+    teacher_id = data.get('id')
+    new_data = data.get('new_data')
+    
+    if not teacher_id or not new_data:
+        return jsonify({'error': 'Teacher ID and new data are required'}), 400
+    
+    with server.lock:
+        if not server.db.fetch_one('SELECT 1 FROM teachers WHERE id = %s', (teacher_id,)):
+            return jsonify({'error': 'Teacher not found'}), 404
+        
+        # Build update query
+        set_clauses = []
+        params = []
+        
+        for key, value in new_data.items():
+            if key in ['email', 'name']:
+                set_clauses.append(f'{key} = %s')
+                params.append(value)
+            elif key in ['classrooms', 'bssid_mapping', 'branches', 'semesters']:
+                set_clauses.append(f'{key} = %s')
+                params.append(json.dumps(value))
+        
+        if not set_clauses:
+            return jsonify({'error': 'No valid fields to update'}), 400
+        
+        query = f'UPDATE teachers SET {", ".join(set_clauses)} WHERE id = %s'
+        params.append(teacher_id)
+        server.db.execute(query, params, commit=True)
+        
+        return jsonify({'message': 'Profile updated successfully'}), 200
+
+@app.route('/teacher/change_password', methods=['POST'])
+def change_teacher_password():
+    data = request.json
+    teacher_id = data.get('id')
+    old_password = data.get('old_password')
+    new_password = data.get('new_password')
+    
+    if not all([teacher_id, old_password, new_password]):
+        return jsonify({'error': 'All fields are required'}), 400
+    
+    with server.lock:
+        teacher = server.db.fetch_one('SELECT * FROM teachers WHERE id = %s', (teacher_id,))
+        if not teacher:
+            return jsonify({'error': 'Teacher not found'}), 404
+        
+        if not check_password_hash(teacher['password'], old_password):
+            return jsonify({'error': 'Incorrect current password'}), 401
+        server.db.execute(
+            'UPDATE teachers SET password = %s WHERE id = %s',
+            (generate_password_hash(new_password), teacher_id),
+            commit=True
+        )
+        
+        return jsonify({'message': 'Password changed successfully'}), 200
+
+@app.route('/teacher/update_bssid', methods=['POST'])
+def update_bssid_mapping():
+    data = request.json
+    teacher_id = data.get('teacher_id')
+    classroom = data.get('classroom')
+    bssid = data.get('bssid')
+    
+    if not all([teacher_id, classroom]):
+        return jsonify({'error': 'Teacher ID and classroom are required'}), 400
+    
+    with server.lock:
+        teacher = server.db.fetch_one('SELECT * FROM teachers WHERE id = %s', (teacher_id,))
+        if not teacher:
+            return jsonify({'error': 'Teacher not found'}), 404        
+        # Get current bssid_mapping
+        bssid_mapping = json.loads(teacher['bssid_mapping'])
+        
+        # Update the mapping
+        bssid_mapping[classroom] = bssid
+        
+        # Update teacher record
+        server.db.execute(
+            'UPDATE teachers SET bssid_mapping = %s WHERE id = %s',
+            (json.dumps(bssid_mapping), teacher_id),
+            commit=True
+        )
+        
+        # Add classroom to teacher's classrooms if not present
+        classrooms = json.loads(teacher['classrooms'])
+        if classroom not in classrooms:
+            classrooms.append(classroom)
+            server.db.execute(
+                'UPDATE teachers SET classrooms = %s WHERE id = %s',
+                (json.dumps(classrooms), teacher_id),
+                commit=True
+            )
+        
+        # Update authorized BSSID if it matches this classroom's previous BSSID
+        settings = server.db.fetch_one('SELECT authorized_bssid FROM server_settings')
+        if settings['authorized_bssid'] == bssid_mapping.get(classroom):
+            server.db.execute(
+                'UPDATE server_settings SET authorized_bssid = %s',
+                (bssid,),
+                commit=True
+            )
+        
+        return jsonify({
+            'message': 'BSSID mapping updated successfully',
+            'bssid_mapping': bssid_mapping
+        }), 200
+
+@app.route('/teacher/start_session', methods=['POST'])
+def start_session():
+    data = request.json
+    teacher_id = data.get('teacher_id')
+    classroom = data.get('classroom')
+    subject = data.get('subject')
+    branch = data.get('branch')
+    semester = data.get('semester')
+    
+    if not all([teacher_id, classroom, subject]):
+        return jsonify({'error': 'Teacher ID, classroom and subject are required'}), 400
+    
+    with server.lock:
+        if not server.db.fetch_one('SELECT 1 FROM teachers WHERE id = %s', (teacher_id,)):
+            return jsonify({'error': 'Teacher not found'}), 404
+        
+        # Check for existing active session in this classroom
+        active_session = server.db.fetch_one(
+            'SELECT 1 FROM sessions WHERE classroom = %s AND end_time IS NULL',
+            (classroom,)
+        )
+        if active_session:
+            return jsonify({'error': 'There is already an active session for this classroom'}), 400
+        
+        session_id = str(uuid.uuid4())
+        start_time = datetime.now().isoformat()
+        
+        server.db.execute(
+            'INSERT INTO sessions (id, teacher_id, classroom, subject, branch, semester, start_time, ad_hoc) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
+            (
+                session_id,
+                teacher_id,
+                classroom,
+                subject,
+                branch,
+                semester,
+                start_time,
+                int(data.get('ad_hoc', False))
+            ),
+            commit=True
+        )
+        
+        # Set authorized BSSID from teacher's mapping
+        teacher = server.db.fetch_one('SELECT bssid_mapping FROM teachers WHERE id = %s', (teacher_id,))
+        bssid_mapping = json.loads(teacher['bssid_mapping'])
+        authorized_bssid = bssid_mapping.get(classroom)
+        
+        if authorized_bssid:
+            server.db.execute(
+                'UPDATE server_settings SET authorized_bssid = %s',
+                (authorized_bssid,),
+                commit=True
+            )
+        
+        return jsonify({
+            'message': 'Session started successfully',
+            'session_id': session_id,
+            'authorized_bssid': authorized_bssid
+        }), 201
+
+@app.route('/teacher/end_session', methods=['POST'])
+def end_session():
+    data = request.json
+    session_id = data.get('session_id')
+    
+    if not session_id:
+        return jsonify({'error': 'Session ID is required'}), 400
+    
+    with server.lock:
+        session = server.db.fetch_one('SELECT * FROM sessions WHERE id = %s', (session_id,))
+        if not session or session['end_time']:
+            return jsonify({'error': 'Session not found or already ended'}), 404
+        
+        end_time = datetime.now().isoformat()
+        
+        # Update session
+        server.db.execute(
+            'UPDATE sessions SET end_time = %s WHERE id = %s',
+            (end_time, session_id),
+            commit=True
+        )
+        
+        # Record attendance for checked-in students
+        classroom = session['classroom']
+        session_start = datetime.fromisoformat(session['start_time'])
+        session_end = datetime.now()
+        
+        checkins = server.db.fetch_all(
+            'SELECT * FROM checkins WHERE student_id IN '
+            '(SELECT id FROM students WHERE classroom = %s) '
+            'AND timestamp BETWEEN %s AND %s',
+            (classroom, session['start_time'], end_time)
+        )
+        
+        for checkin in checkins:
+            student_id = checkin['student_id']
+            student = server.db.fetch_one('SELECT * FROM students WHERE id = %s', (student_id,))
+            if not student:
+                continue
             
-        email = reset_record['email']
-        hashed_password = generate_password_hash(new_password)
+            authorized_bssid = server.db.fetch_one('SELECT authorized_bssid FROM server_settings')['authorized_bssid']
+            is_authorized = checkin['bssid'] == authorized_bssid
+            
+            date_str = session_start.date().isoformat()
+            session_key = f"{session['subject']}_{session_id}"
+            
+            attendance = json.loads(student['attendance']) if student['attendance'] else {}
+            if date_str not in attendance:
+                attendance[date_str] = {}
+            
+            attendance[date_str][session_key] = {
+                'status': 'present' if is_authorized else 'absent',
+                'subject': session['subject'],
+                'classroom': classroom,
+                'start_time': session['start_time'],
+                'end_time': end_time,
+                'branch': session['branch'],
+                'semester': session['semester']
+            }
+            
+            server.db.execute(
+                'UPDATE students SET attendance = %s WHERE id = %s',
+                (json.dumps(attendance), student_id),
+                commit=True
+            )
         
-        # Update password in the teachers table
-        server.db.execute("UPDATE teachers SET password = %s WHERE email = %s", (hashed_password, email), commit=True)
-        # Invalidate the token
-        server.db.execute("DELETE FROM password_reset_tokens WHERE email = %s", (email,), commit=True)
+        # Clear authorized BSSID
+        server.db.execute(
+            'UPDATE server_settings SET authorized_bssid = NULL',
+            commit=True
+        )
+        
+        return jsonify({'message': 'Session ended successfully'}), 200
 
-    logger.info(f"Password has been reset for email: {email}")
-    return jsonify({"message": "Password has been reset successfully."}), 200
+@app.route('/teacher/get_sessions', methods=['GET'])
+def get_sessions():
+    teacher_id = request.args.get('teacher_id')
+    classroom = request.args.get('classroom')
+    
+    query = 'SELECT * FROM sessions'
+    params = []
+    conditions = []
+    
+    if teacher_id:
+        conditions.append('teacher_id = %s')
+        params.append(teacher_id)
+    if classroom:
+        conditions.append('classroom = %s')
+        params.append(classroom)
+    
+    if conditions:
+        query += ' WHERE ' + ' AND '.join(conditions)
+    
+    with server.lock:
+        sessions = server.db.fetch_all(query, params)
+        sessions_list = [dict(session) for session in sessions]
+    
+    return jsonify({'sessions': sessions_list}), 200
 
+@app.route('/teacher/get_active_sessions', methods=['GET'])
+def get_active_sessions():
+    teacher_id = request.args.get('teacher_id')
+    
+    query = 'SELECT * FROM sessions WHERE end_time IS NULL'
+    params = []
+    
+    if teacher_id:
+        query += ' AND teacher_id = %s'
+        params.append(teacher_id)
+    
+    with server.lock:
+        sessions = server.db.fetch_all(query, params)
+        sessions_list = [dict(session) for session in sessions]
+    
+    return jsonify({'sessions': sessions_list}), 200
 
-# =============================================================================
-# --- Student Endpoints ---
-# =============================================================================
+@app.route('/teacher/set_bssid', methods=['POST'])
+def set_bssid():
+    data = request.json
+    bssid = data.get('bssid')
+    
+    if not bssid:
+        return jsonify({'error': 'BSSID is required'}), 400
+    
+    with server.lock:
+        server.db.execute(
+            'UPDATE server_settings SET authorized_bssid = %s',
+            (bssid,),
+            commit=True
+        )
+    
+    return jsonify({'message': 'Authorized BSSID set successfully'}), 200
+
+@app.route('/teacher/get_status', methods=['GET'])
+def get_status():
+    classroom = request.args.get('classroom')
+    
+    status = {
+        'authorized_bssid': server.db.fetch_one('SELECT authorized_bssid FROM server_settings')['authorized_bssid'],
+        'students': {}
+    }
+    
+    query = 'SELECT * FROM students'
+    params = []
+    if classroom:
+        query += ' WHERE classroom = %s'
+        params.append(classroom)
+    
+    with server.lock:
+        students = server.db.fetch_all(query, params)
+        
+        for student in students:
+            student_id = student['id']
+            
+            # Get checkin
+            checkin = server.db.fetch_one(
+                'SELECT * FROM checkins WHERE student_id = %s ORDER BY timestamp DESC LIMIT 1',
+                (student_id,)
+            )
+            
+            # Get timer
+            timer = server.db.fetch_one('SELECT * FROM timers WHERE student_id = %s', (student_id,))
+            
+            authorized_bssid = status['authorized_bssid']
+            is_authorized = checkin and checkin['bssid'] == authorized_bssid
+            
+            status['students'][student_id] = {
+                'name': student['name'],
+                'classroom': student['classroom'],
+                'branch': student['branch'],
+                'semester': student['semester'],
+                'connected': checkin is not None,
+                'authorized': is_authorized,
+                'timestamp': checkin['timestamp'] if checkin else None,
+                'timer': {
+                    'status': timer['status'] if timer else 'stop',
+                    'remaining': timer['remaining'] if timer else 0,
+                    'start_time': timer['start_time'] if timer else None
+                }
+            }
+    
+    return jsonify(status), 200
+
+@app.route('/teacher/manual_override', methods=['POST'])
+def manual_override():
+    data = request.json
+    student_id = data.get('student_id')
+    status = data.get('status')
+    
+    if not all([student_id, status]):
+        return jsonify({'error': 'Student ID and status are required'}), 400
+    
+    if status not in ['present', 'absent']:
+        return jsonify({'error': 'Status must be "present" or "absent"'}), 400
+    
+    with server.lock:
+        if not server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # Check if override exists
+        existing = server.db.fetch_one('SELECT 1 FROM manual_overrides WHERE student_id = %s', (student_id,))
+        
+        if existing:
+            server.db.execute(
+                'UPDATE manual_overrides SET status = %s WHERE student_id = %s',
+                (status, student_id),
+                commit=True
+            )
+        else:
+            server.db.execute(
+                'INSERT INTO manual_overrides (student_id, status) VALUES (%s, %s)',
+                (student_id, status),
+                commit=True
+            )
+        
+        if status == 'present':
+            server.start_timer(student_id)
+        
+        return jsonify({'message': f'Student {student_id} marked as {status}'}), 200
+
+@app.route('/teacher/random_ring', methods=['POST'])
+def random_ring():
+    classroom = request.args.get('classroom')
+    
+    if not classroom:
+        return jsonify({'error': 'Classroom is required'}), 400
+    
+    with server.lock:
+        # Get all students in classroom with attendance data
+        students = server.db.fetch_all(
+            'SELECT id, name, attendance FROM students WHERE classroom = %s',
+            (classroom,)
+        )
+        
+        if len(students) < 2:
+            return jsonify({'error': 'Need at least 2 students for random ring'}), 400
+        
+        # Calculate attendance percentages
+        student_stats = []
+        for student in students:
+            attendance = json.loads(student['attendance']) if student['attendance'] else {}
+            total_sessions = sum(len(sessions) for sessions in attendance.values())
+            present_sessions = sum(1 for sessions in attendance.values() 
+                                 for session in sessions.values() if session.get('status') == 'present')
+            percentage = round((present_sessions / total_sessions) * 100) if total_sessions > 0 else 0
+            
+            student_stats.append({
+                'id': student['id'],
+                'name': student['name'],
+                'attendance_percentage': percentage
+            })
+        
+        # Sort by attendance percentage
+        student_stats.sort(key=lambda x: x['attendance_percentage'])
+        
+        # Select one from bottom 30% and one from top 30%
+        split_point = max(1, len(student_stats) // 3)
+        low_attendance = student_stats[:split_point]
+        high_attendance = student_stats[-split_point:]
+        
+        selected_low = random.choice(low_attendance)
+        selected_high = random.choice(high_attendance)
+        
+        return jsonify({
+            'message': 'Random ring selection complete',
+            'low_attendance_student': selected_low,
+            'high_attendance_student': selected_high
+        }), 200
+
+@app.route('/teacher/get_special_dates', methods=['GET'])
+def get_special_dates():
+    with server.lock:
+        special_dates = server.db.fetch_one('SELECT * FROM special_dates ORDER BY id DESC LIMIT 1')
+        
+        if special_dates:
+            return jsonify({
+                'holidays': json.loads(special_dates['holidays']),
+                'special_schedules': json.loads(special_dates['special_schedules'])
+            }), 200
+        else:
+            return jsonify({
+                'holidays': [],
+                'special_schedules': []
+            }), 200
+
+@app.route('/teacher/update_special_dates', methods=['POST'])
+def update_special_dates():
+    data = request.json
+    holidays = data.get('holidays', [])
+    special_schedules = data.get('special_schedules', [])
+    
+    with server.lock:
+        server.db.execute(
+            'INSERT INTO special_dates (holidays, special_schedules) VALUES (%s, %s)',
+            (json.dumps(holidays), json.dumps(special_schedules)),
+            commit=True
+        )
+    
+    return jsonify({'message': 'Special dates updated successfully'}), 200
+
+@app.route('/teacher/get_timetable', methods=['GET'])
+def get_timetable():
+    branch = request.args.get('branch')
+    semester = request.args.get('semester')
+    
+    if not branch or not semester:
+        return jsonify({'error': 'Branch and semester are required'}), 400
+    
+    with server.lock:
+        timetable = server.db.fetch_one(
+            'SELECT timetable FROM timetables WHERE branch = %s AND semester = %s',
+            (branch, semester)
+        )
+        
+        if timetable:
+            return jsonify({'timetable': json.loads(timetable['timetable'])}), 200
+        else:
+            return jsonify({'timetable': []}), 200
+
+@app.route('/teacher/update_timetable', methods=['POST'])
+def update_timetable():
+    data = request.json
+    branch = data.get('branch')
+    semester = data.get('semester')
+    timetable = data.get('timetable', [])
+    
+    if not branch or not semester:
+        return jsonify({'error': 'Branch and semester are required'}), 400
+    
+    with server.lock:
+        existing = server.db.fetch_one(
+            'SELECT 1 FROM timetables WHERE branch = %s AND semester = %s',
+            (branch, semester)
+        )
+        
+        if existing:
+            server.db.execute(
+                'UPDATE timetables SET timetable = %s WHERE branch = %s AND semester = %s',
+                (json.dumps(timetable), branch, semester),
+                commit=True
+            )
+        else:
+            server.db.execute(
+                'INSERT INTO timetables (branch, semester, timetable) VALUES (%s, %s, %s)',
+                (branch, semester, json.dumps(timetable)),
+                commit=True
+            )
+    
+    return jsonify({'message': 'Timetable updated successfully'}), 200
+
+# Student endpoints
+@app.route('/student/login', methods=['POST'])
+def student_login():
+    data = request.json
+    student_id = data.get('id')
+    password = data.get('password')
+    device_id = data.get('device_id')
+    
+    if not all([student_id, password, device_id]):
+        return jsonify({'error': 'ID, password and device ID are required'}), 400
+    
+    with server.lock:
+        student = server.db.fetch_one('SELECT * FROM students WHERE id = %s', (student_id,))
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+        
+        if not check_password_hash(student['password'], password):
+            return jsonify({'error': 'Incorrect password'}), 401
+        
+        # Check if already logged in on another device
+        active_device = server.db.fetch_one(
+            'SELECT * FROM active_devices WHERE student_id = %s AND device_id != %s',
+            (student_id, device_id)
+        )
+        if active_device:
+            return jsonify({'error': 'This account is already logged in on another device'}), 403
+        
+        # Update or insert active device
+        existing = server.db.fetch_one(
+            'SELECT 1 FROM active_devices WHERE student_id = %s',
+            (student_id,)
+        )
+        
+        if existing:
+            server.db.execute(
+                'UPDATE active_devices SET device_id = %s, last_activity = %s WHERE student_id = %s',
+                (device_id, datetime.now().isoformat(), student_id),
+                commit=True
+            )
+        else:
+            server.db.execute(
+                'INSERT INTO active_devices (student_id, device_id, last_activity) VALUES (%s, %s, %s)',
+                (student_id, device_id, datetime.now().isoformat()),
+                commit=True
+            )
+        
+        # Get classroom BSSID from any teacher
+        teacher = server.db.fetch_one(
+            'SELECT bssid_mapping FROM teachers WHERE classrooms::jsonb ? %s',
+            (student['classroom'],)
+        )
+        
+        classroom_bssid = None
+        if teacher:
+            bssid_mapping = json.loads(teacher['bssid_mapping'])
+            classroom_bssid = bssid_mapping.get(student['classroom'])
+        
+        return jsonify({
+            'message': 'Login successful',
+            'student': {
+                'id': student['id'],
+                'name': student['name'],
+                'classroom': student['classroom'],
+                'branch': student['branch'],
+                'semester': student['semester']
+            },
+            'classroom_bssid': classroom_bssid
+        }), 200
 
 @app.route('/student/checkin', methods=['POST'])
 def student_checkin():
-    """
-    Student Check-in Endpoint.
-    
-    A student's device calls this periodically to report its status and BSSID.
-    If the BSSID matches the authorized one for a session, a timer starts.
-    """
-    data = request.get_json()
-    required = ['student_id', 'device_id', 'bssid']
-    if not data or not all(k in data for k in required):
-        raise ApiError(f'Missing required fields: {required}')
+    data = request.json
+    student_id = data.get('student_id')
+    bssid = data.get('bssid')
+    device_id = data.get('device_id')
+
+    if not all([student_id, device_id]):
+        return jsonify({'error': 'Student ID and device ID are required'}), 400
 
     with server.lock:
-        # Verify the device is authorized and update its activity
-        if not server.db.execute('UPDATE active_devices SET last_activity = %s WHERE student_id = %s AND device_id = %s', 
-                                 (datetime.now().isoformat(), data['student_id'], data['device_id']), commit=True).rowcount:
-            raise ApiError('Unauthorized device or session expired', 403)
-        
-        # Record the check-in (UPSERT)
+        if not server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student not found'}), 404
+
+        active_device = server.db.fetch_one(
+            'SELECT 1 FROM active_devices WHERE student_id = %s AND device_id = %s',
+            (student_id, device_id)
+        )
+        if not active_device:
+            return jsonify({'error': 'Unauthorized device'}), 403
+
+        # Update last activity
         server.db.execute(
-            'INSERT INTO checkins (student_id, device_id, timestamp, bssid) VALUES (%s, %s, %s, %s) '
-            'ON CONFLICT (student_id, device_id) DO UPDATE SET timestamp = EXCLUDED.timestamp, bssid = EXCLUDED.bssid',
-            (data['student_id'], data['device_id'], datetime.now().isoformat(), data['bssid']), commit=True
+            'UPDATE active_devices SET last_activity = %s WHERE student_id = %s',
+            (datetime.now().isoformat(), student_id),
+            commit=True
         )
 
-        authorized_bssid = server.db.get_setting('authorized_bssid')
-        is_authorized = authorized_bssid and authorized_bssid == data['bssid']
+        # Record checkin
+        existing_checkin = server.db.fetch_one(
+            'SELECT 1 FROM checkins WHERE student_id = %s AND device_id = %s',
+            (student_id, device_id)
+        )
         
-        if is_authorized:
-            server.start_timer_for_student(data['student_id'])
-            
+        if existing_checkin:
+            server.db.execute(
+                'UPDATE checkins SET timestamp = %s, bssid = %s WHERE student_id = %s AND device_id = %s',
+                (datetime.now().isoformat(), bssid, student_id, device_id),
+                commit=True
+            )
+        else:
+            server.db.execute(
+                'INSERT INTO checkins (student_id, timestamp, bssid, device_id) VALUES (%s, %s, %s, %s)',
+                (student_id, datetime.now().isoformat(), bssid, device_id),
+                commit=True
+            )
+
+        # Get authorized BSSID for student's classroom
+        student = server.db.fetch_one('SELECT classroom FROM students WHERE id = %s', (student_id,))
+        classroom = student['classroom']
+        
+        teacher = server.db.fetch_one(
+            'SELECT bssid_mapping FROM teachers WHERE classrooms::jsonb ? %s',
+            (classroom,)
+        )
+        
+        authorized_bssid = None
+        if teacher:
+            bssid_mapping = json.loads(teacher['bssid_mapping'])
+            authorized_bssid = bssid_mapping.get(classroom)
+
+        if bssid and bssid == authorized_bssid:
+            server.start_timer(student_id)
+
         return jsonify({
             'message': 'Check-in successful',
-            'status': 'present_authorized' if is_authorized else 'present_unauthorized',
+            'status': 'present' if bssid and bssid == authorized_bssid else 'absent',
             'authorized_bssid': authorized_bssid
         }), 200
 
+@app.route('/student/timer/start', methods=['POST'])
+def student_start_timer():
+    data = request.json
+    student_id = data.get('student_id')
+    device_id = data.get('device_id')
+
+    if not all([student_id, device_id]):
+        return jsonify({'error': 'Student ID and device ID are required'}), 400
+
+    with server.lock:
+        if not server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student not found'}), 404
+
+        if not server.db.fetch_one(
+            'SELECT 1 FROM active_devices WHERE student_id = %s AND device_id = %s',
+            (student_id, device_id)
+        ):
+            return jsonify({'error': 'Unauthorized device'}), 403
+
+        # Check authorization via latest checkin
+        checkin = server.db.fetch_one(
+            'SELECT * FROM checkins WHERE student_id = %s ORDER BY timestamp DESC LIMIT 1',
+            (student_id,)
+        )
+
+        # Get authorized BSSID for student's classroom
+        student = server.db.fetch_one('SELECT classroom FROM students WHERE id = %s', (student_id,))
+        classroom = student['classroom']
+        
+        teacher = server.db.fetch_one(
+            'SELECT bssid_mapping FROM teachers WHERE classrooms::jsonb ? %s',
+            (classroom,)
+        )
+        
+        authorized_bssid = None
+        if teacher:
+            bssid_mapping = json.loads(teacher['bssid_mapping'])
+            authorized_bssid = bssid_mapping.get(classroom)
+
+        if not checkin or checkin['bssid'] != authorized_bssid:
+            return jsonify({'error': 'Not authorized to start timer - BSSID mismatch'}), 403
+
+        # Update last activity
+        server.db.execute(
+            'UPDATE active_devices SET last_activity = %s WHERE student_id = %s',
+            (datetime.now().isoformat(), student_id),
+            commit=True
+        )
+
+        server.start_timer(student_id)
+
+        return jsonify({
+            'message': 'Timer started successfully',
+            'status': 'running'
+        }), 200
+
+@app.route('/student/timer/stop', methods=['POST'])
+def student_stop_timer():
+    data = request.json
+    student_id = data.get('student_id')
+    device_id = data.get('device_id')
+    
+    if not all([student_id, device_id]):
+        return jsonify({'error': 'Student ID and device ID are required'}), 400
+    
+    with server.lock:
+        if not server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student not found'}), 404
+        
+        if not server.db.fetch_one(
+            'SELECT 1 FROM active_devices WHERE student_id = %s AND device_id = %s',
+            (student_id, device_id)
+        ):
+            return jsonify({'error': 'Unauthorized device'}), 403
+        
+        timer = server.db.fetch_one('SELECT * FROM timers WHERE student_id = %s', (student_id,))
+        if not timer or timer['status'] == 'stop':
+            return jsonify({'error': 'No active timer to stop'}), 400
+        
+        # Update last activity
+        server.db.execute(
+            'UPDATE active_devices SET last_activity = %s WHERE student_id = %s',
+            (datetime.now().isoformat(), student_id),
+            commit=True
+        )
+        
+        if timer['status'] == 'running':
+            server.record_attendance(student_id)
+        
+        server.db.execute(
+            'UPDATE timers SET status = %s, remaining = 0 WHERE student_id = %s',
+            ('stop', student_id),
+            commit=True
+        )
+        
+        return jsonify({
+            'message': 'Timer stopped successfully',
+            'status': 'stop'
+        }), 200
 
 @app.route('/student/get_status', methods=['GET'])
 def student_get_status():
-    """
-    Get Student Status Endpoint.
-    
-    Allows a student's app to poll for its current attendance status,
-    including timer state and authorization.
-    """
     student_id = request.args.get('student_id')
     device_id = request.args.get('device_id')
-    if not student_id or not device_id:
-        raise ApiError('Student ID and device ID are required')
-
+    
+    if not all([student_id, device_id]):
+        return jsonify({'error': 'Student ID and device ID are required'}), 400
+    
     with server.lock:
-        # Verify the device and update activity
-        if not server.db.execute('UPDATE active_devices SET last_activity = %s WHERE student_id = %s AND device_id = %s', 
-                                 (datetime.now().isoformat(), student_id, device_id), commit=True).rowcount:
-            raise ApiError('Unauthorized device or session expired', 403)
+        if not server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student not found'}), 404
         
-        student = server.db.fetch_one('SELECT name, classroom FROM students WHERE id = %s', (student_id,))
-        checkin = server.db.fetch_one('SELECT timestamp, bssid FROM checkins WHERE student_id = %s', (student_id,))
-        timer = server.db.fetch_one('SELECT status, remaining, start_time FROM timers WHERE student_id = %s', (student_id,))
-        authorized_bssid = server.db.get_setting('authorized_bssid')
+        if not server.db.fetch_one(
+            'SELECT 1 FROM active_devices WHERE student_id = %s AND device_id = %s',
+            (student_id, device_id)
+        ):
+            return jsonify({'error': 'Unauthorized device'}), 403
         
-        is_authorized = checkin and authorized_bssid and checkin['bssid'] == authorized_bssid
-
+        # Update last activity
+        server.db.execute(
+            'UPDATE active_devices SET last_activity = %s WHERE student_id = %s',
+            (datetime.now().isoformat(), student_id),
+            commit=True
+        )
+        
+        # Get checkin
+        checkin = server.db.fetch_one(
+            'SELECT * FROM checkins WHERE student_id = %s ORDER BY timestamp DESC LIMIT 1',
+            (student_id,)
+        )
+        
+        # Get timer
+        timer = server.db.fetch_one('SELECT * FROM timers WHERE student_id = %s', (student_id,))
+        
+        authorized_bssid = server.db.fetch_one('SELECT authorized_bssid FROM server_settings')['authorized_bssid']
+        is_authorized = checkin and checkin['bssid'] == authorized_bssid
+        
         status = {
-            'student_id': student_id, 'name': student['name'], 'classroom': student['classroom'],
-            'connected': bool(checkin), 'authorized': is_authorized,
+            'student_id': student_id,
+            'name': server.db.fetch_one('SELECT name FROM students WHERE id = %s', (student_id,))['name'],
+            'classroom': server.db.fetch_one('SELECT classroom FROM students WHERE id = %s', (student_id,))['classroom'],
+            'connected': checkin is not None,
+            'authorized': is_authorized,
             'timestamp': checkin['timestamp'] if checkin else None,
             'timer': {
                 'status': timer['status'] if timer else 'stop',
                 'remaining': timer['remaining'] if timer else 0,
                 'start_time': timer['start_time'] if timer else None
-            },
-            'authorized_bssid': authorized_bssid
+            }
         }
+        
         return jsonify(status), 200
 
-# ... Other student endpoints like get_attendance, get_timetable would follow a similar pattern ...
-
-
-# =============================================================================
-# --- Teacher Endpoints ---
-# =============================================================================
-
-@app.route('/teacher/start_session', methods=['POST'])
-def start_session():
-    """
-    Starts an attendance session for a classroom.
-    This sets the 'authorized_bssid' for the server based on the teacher's
-    mapping for that classroom.
-    """
-    data = request.get_json()
-    required = ['teacher_id', 'classroom', 'subject']
-    if not data or not all(k in data for k in required):
-        raise ApiError(f'Missing fields. Required: {required}')
-
+@app.route('/student/get_attendance', methods=['GET'])
+def student_get_attendance():
+    student_id = request.args.get('student_id')
+    device_id = request.args.get('device_id')
+    
+    if not all([student_id, device_id]):
+        return jsonify({'error': 'Student ID and device ID are required'}), 400
+    
     with server.lock:
-        teacher = server.db.fetch_one('SELECT bssid_mapping FROM teachers WHERE id = %s', (data['teacher_id'],))
-        if not teacher:
-            raise ApiError('Teacher not found', 404)
+        if not server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student not found'}), 404
         
-        if server.db.fetch_one('SELECT 1 FROM sessions WHERE classroom = %s AND end_time IS NULL', (data['classroom'],)):
-            raise ApiError('An active session already exists for this classroom', 409)
+        if not server.db.fetch_one(
+            'SELECT 1 FROM active_devices WHERE student_id = %s AND device_id = %s',
+            (student_id, device_id)
+        ):
+            return jsonify({'error': 'Unauthorized device'}), 403
         
-        session_id = str(uuid.uuid4())
-        
+        # Update last activity
         server.db.execute(
-            'INSERT INTO sessions (id, teacher_id, classroom, subject, branch, semester, start_time) VALUES (%s, %s, %s, %s, %s, %s, %s)',
-            (session_id, data['teacher_id'], data['classroom'], data['subject'], data.get('branch'),
-             data.get('semester'), datetime.now().isoformat()), commit=True
+            'UPDATE active_devices SET last_activity = %s WHERE student_id = %s',
+            (datetime.now().isoformat(), student_id),
+            commit=True
         )
         
-        bssid_mapping = json.loads(teacher['bssid_mapping'] or '{}')
-        authorized_bssid = bssid_mapping.get(data['classroom'])
+        student = server.db.fetch_one('SELECT attendance FROM students WHERE id = %s', (student_id,))
         
-        if authorized_bssid:
-            server.db.execute("UPDATE server_settings SET value = %s WHERE key = 'authorized_bssid'", (authorized_bssid,), commit=True)
-            logger.info(f"Session {session_id} started. Authorized BSSID for {data['classroom']} set to {authorized_bssid}.")
-        else:
-            # Clear any previous BSSID
-            server.db.execute("UPDATE server_settings SET value = NULL WHERE key = 'authorized_bssid'", commit=True)
-            logger.warning(f"Session {session_id} started, but no BSSID is configured for classroom {data['classroom']}.")
+        return jsonify({
+            'attendance': json.loads(student['attendance']) if student['attendance'] else {}
+        }), 200
 
-        return jsonify({'message': 'Session started successfully', 'session_id': session_id, 'authorized_bssid': authorized_bssid}), 201
-
-
-@app.route('/teacher/end_session', methods=['POST'])
-def end_session():
-    """
-    Ends an active attendance session.
-    This clears the 'authorized_bssid' on the server.
-    """
-    data = request.get_json()
-    if not data or 'session_id' not in data:
-        raise ApiError('Session ID is required')
-
-    with server.lock:
-        session = server.db.fetch_one('SELECT id, end_time FROM sessions WHERE id = %s', (data['session_id'],))
-        if not session:
-            raise ApiError('Session not found', 404)
-        if session['end_time']:
-            raise ApiError('Session already ended', 409)
-
-        server.db.execute('UPDATE sessions SET end_time = %s WHERE id = %s', (datetime.now().isoformat(), data['session_id']), commit=True)
-        server.db.execute("UPDATE server_settings SET value = NULL WHERE key = 'authorized_bssid'", commit=True)
-        logger.info(f"Session {data['session_id']} ended. Authorized BSSID cleared.")
-
-        return jsonify({'message': 'Session ended successfully'}), 200
-
-@app.route('/teacher/get_classroom_status', methods=['GET'])
-def get_classroom_status():
-    """
-    Gets the real-time status of all students in a given classroom.
-    """
+@app.route('/student/get_active_session', methods=['GET'])
+def get_active_session():
+    student_id = request.args.get('student_id')
     classroom = request.args.get('classroom')
-    if not classroom:
-        raise ApiError('Classroom parameter is required')
-
+    
+    if not student_id or not classroom:
+        return jsonify({'error': 'Student ID and classroom are required'}), 400
+    
     with server.lock:
-        authorized_bssid = server.db.get_setting('authorized_bssid')
-        status = {
-            'authorized_bssid': authorized_bssid,
-            'students': {}
-        }
+        if not server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student not found'}), 404
         
-        students = server.db.fetch_all('SELECT id, name, branch, semester FROM students WHERE classroom = %s', (classroom,))
+        session = server.db.fetch_one(
+            'SELECT * FROM sessions WHERE classroom = %s AND end_time IS NULL',
+            (classroom,)
+        )
         
-        for student in students:
-            student_id = student['id']
-            checkin = server.db.fetch_one('SELECT timestamp, bssid FROM checkins WHERE student_id = %s', (student_id,))
-            timer = server.db.fetch_one('SELECT status, remaining FROM timers WHERE student_id = %s', (student_id,))
-            
-            is_authorized = checkin and authorized_bssid and checkin['bssid'] == authorized_bssid
-            
-            status['students'][student_id] = {
-                'name': student['name'],
-                'connected': bool(checkin),
-                'authorized': is_authorized,
-                'last_seen': checkin['timestamp'] if checkin else None,
-                'timer_status': timer['status'] if timer else 'stop',
-                'timer_remaining': timer['remaining'] if timer else 0
-            }
-    return jsonify(status), 200
+        if session:
+            return jsonify({
+                'active': True,
+                'session': dict(session)
+            }), 200
+        else:
+            return jsonify({'active': False}), 200
 
-@app.route('/teacher/reports/attendance_summary', methods=['GET'])
-def get_attendance_summary():
-    """
-    Generates an attendance summary report for a class.
-
-    Query Params:
-    - branch (str): The branch of the class.
-    - semester (int): The semester of the class.
-    - start_date (str): The start date of the report (YYYY-MM-DD).
-    - end_date (str): The end date of the report (YYYY-MM-DD).
-    """
+@app.route('/student/get_timetable', methods=['GET'])
+def student_get_timetable():
+    student_id = request.args.get('student_id')
     branch = request.args.get('branch')
     semester = request.args.get('semester')
-    start_date = request.args.get('start_date')
-    end_date = request.args.get('end_date')
-
-    if not all([branch, semester, start_date, end_date]):
-        raise ApiError("branch, semester, start_date, and end_date are required query parameters.")
-
-    students = server.db.fetch_all("SELECT id, name, attendance FROM students WHERE branch = %s AND semester = %s", (branch, int(semester)))
     
-    report = []
-    for student in students:
-        attendance_data = json.loads(student['attendance'] or '{}')
-        present_count = 0
-        absent_count = 0
-        total_sessions = 0
-        
-        for date_str, sessions in attendance_data.items():
-            if start_date <= date_str <= end_date:
-                for session_details in sessions.values():
-                    total_sessions += 1
-                    if session_details.get('status') == 'present':
-                        present_count += 1
-                    else:
-                        absent_count += 1
-        
-        percentage = (present_count / total_sessions * 100) if total_sessions > 0 else 0
-        
-        report.append({
-            "student_id": student['id'],
-            "name": student['name'],
-            "total_sessions": total_sessions,
-            "present": present_count,
-            "absent": absent_count,
-            "percentage": round(percentage, 2)
-        })
+    if not student_id or not branch or not semester:
+        return jsonify({'error': 'Student ID, branch and semester are required'}), 400
     
-    return jsonify({"report": report}), 200
-
-
-# =============================================================================
-# --- Admin Endpoints ---
-# =============================================================================
-# These endpoints are protected and can only be accessed by the 'admin' user.
-
-@app.route('/admin/teachers', methods=['GET'])
-@admin_required
-def list_teachers():
-    """[Admin] Lists all teacher accounts."""
-    teachers = server.db.fetch_all("SELECT id, email, name FROM teachers")
-    return jsonify({"teachers": teachers}), 200
-
-@app.route('/admin/teachers', methods=['POST'])
-@admin_required
-def create_teacher():
-    """
-    [Admin] Creates a new teacher account.
-    """
-    data = request.get_json()
-    if not data or not all(k in data for k in ['id', 'password', 'email', 'name']):
-        raise ApiError('id, password, email, and name are required')
-
     with server.lock:
-        if server.db.fetch_one('SELECT 1 FROM teachers WHERE id = %s OR email = %s', (data['id'], data['email'])):
-            raise ApiError('Teacher ID or email already exists', 409)
+        if not server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student not found'}), 404        
+        timetable = server.db.fetch_one(
+            'SELECT timetable FROM timetables WHERE branch = %s AND semester = %s',
+            (branch, semester)
+        )
+        
+        if timetable:
+            return jsonify({
+                'timetable': json.loads(timetable['timetable'])
+            }), 200
+        else:
+            return jsonify({
+                'timetable': []
+            }), 200
+
+@app.route('/student/ping', methods=['POST'])
+def student_ping():
+    data = request.json
+    student_id = data.get('student_id')
+    device_id = data.get('device_id')
+    
+    if not all([student_id, device_id]):
+        return jsonify({'error': 'Student ID and device ID are required'}), 400
+    
+    with server.lock:
+        if not server.db.fetch_one('SELECT 1 FROM students WHERE id = %s', (student_id,)):
+            return jsonify({'error': 'Student not found'}), 404
+        
+        if not server.db.fetch_one(
+            'SELECT 1 FROM active_devices WHERE student_id = %s AND device_id = %s',
+            (student_id, device_id)
+        ):
+            return jsonify({'error': 'Unauthorized device'}), 403
         
         server.db.execute(
-            'INSERT INTO teachers (id, password, email, name, classrooms, bssid_mapping, branches, semesters) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
-            (data['id'], generate_password_hash(data['password']), data['email'], data['name'], 
-             json.dumps([]), json.dumps({}), json.dumps([]), json.dumps([])), commit=True
+            'UPDATE active_devices SET last_activity = %s WHERE student_id = %s',
+            (datetime.now().isoformat(), student_id),
+            commit=True
         )
-        logger.info(f"Admin created new teacher account: {data['id']}")
-        return jsonify({'message': f"Teacher '{data['id']}' created successfully"}), 201
+        
+        return jsonify({'message': 'Ping successful'}), 200
 
-@app.route('/admin/teachers/<string:teacher_id>', methods=['DELETE'])
-@admin_required
-def delete_teacher(teacher_id):
-    """[Admin] Deletes a teacher account."""
-    if teacher_id == 'admin':
-        raise ApiError("The primary admin account cannot be deleted.", 403)
+@app.route('/student/cleanup_dead_sessions', methods=['POST'])
+def cleanup_dead_sessions():
+    data = request.json
+    student_id = data.get('student_id')
+    device_id = data.get('device_id')
+    
+    if not all([student_id, device_id]):
+        return jsonify({'error': 'Student ID and device ID are required'}), 400
     
     with server.lock:
-        # The ON DELETE CASCADE on the sessions table will handle associated sessions.
-        result = server.db.execute("DELETE FROM teachers WHERE id = %s", (teacher_id,), commit=True)
-        if result.rowcount == 0:
-            raise ApiError("Teacher not found", 404)
-    
-    logger.info(f"Admin deleted teacher account: {teacher_id}")
-    return jsonify({"message": f"Teacher '{teacher_id}' and all their sessions have been deleted."}), 200
-
-
-@app.route('/admin/settings', methods=['GET'])
-@admin_required
-def get_settings():
-    """[Admin] Retrieves all server settings."""
-    settings = server.db.fetch_all("SELECT key, value FROM server_settings")
-    return jsonify(dict(settings)), 200
-
-
-@app.route('/admin/settings', methods=['PUT'])
-@admin_required
-def update_settings():
-    """
-    [Admin] Updates server settings.
-    JSON Payload: { "setting_key": "new_value", ... }
-    """
-    new_settings = request.get_json()
-    if not new_settings:
-        raise ApiError("No settings provided to update.")
-    
-    with server.lock:
-        for key, value in new_settings.items():
+        # Only cleanup if the device matches
+        device = server.db.fetch_one(
+            'SELECT * FROM active_devices WHERE student_id = %s AND device_id = %s',
+            (student_id, device_id)
+        )
+        if device:
             server.db.execute(
-                "UPDATE server_settings SET value = %s WHERE key = %s",
-                (str(value), key),
+                'DELETE FROM active_devices WHERE student_id = %s',
+                (student_id,),
                 commit=True
             )
-            # Update in-memory cache as well
-            if hasattr(server, key.upper()):
-                setattr(server, key.upper(), int(value) if value.isdigit() else value)
+        
+        server.db.execute(
+            'DELETE FROM checkins WHERE student_id = %s',
+            (student_id,),
+            commit=True
+        )
+        
+        server.db.execute(
+            'DELETE FROM timers WHERE student_id = %s',
+            (student_id,),
+            commit=True
+        )
+    
+    return jsonify({'message': 'Session cleanup completed'}), 200
 
-    logger.info(f"Admin updated server settings: {new_settings}")
-    return jsonify({"message": "Server settings updated successfully."}), 200
-
-
-# -----------------------------------------------------------------------------
-# --- Main Execution ---
-# -----------------------------------------------------------------------------
 if __name__ == '__main__':
-    logger.info(f"Starting Attendance Server on host 0.0.0.0, port {server.SERVER_PORT}")
-    # Note: For production, use a proper WSGI server like Gunicorn or uWSGI,
-    # e.g., gunicorn --workers 4 --bind 0.0.0.0:5000 your_script_name:app
+    logger.info(f"Starting server on port {server.SERVER_PORT}")
     app.run(host='0.0.0.0', port=server.SERVER_PORT)
