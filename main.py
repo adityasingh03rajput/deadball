@@ -1189,16 +1189,19 @@ def student_login():
                 commit=True
             )
         
-        # Get classroom BSSID from any teacher
-        teacher = server.db.fetch_one(
-            'SELECT bssid_mapping FROM teachers WHERE json_extract(classrooms, ?) IS NOT NULL',
-            (f'$."{student["classroom"]}"',)
-        )
-        
+        # New logic: Find BSSID by checking Python list of classrooms
+        teachers = server.db.fetch_all('SELECT bssid_mapping, classrooms FROM teachers')
         classroom_bssid = None
-        if teacher:
-            bssid_mapping = json.loads(teacher['bssid_mapping'])
-            classroom_bssid = bssid_mapping.get(student['classroom'])
+
+        for teacher in teachers:
+            try:
+                classrooms = json.loads(teacher['classrooms'])
+                bssid_mapping = json.loads(teacher['bssid_mapping'])
+                if student['classroom'] in classrooms:
+                    classroom_bssid = bssid_mapping.get(student['classroom'])
+                    break
+            except Exception as e:
+                continue  # fail-safe
         
         return jsonify({
             'message': 'Login successful',
