@@ -47,7 +47,8 @@ class JSONDatabase:
                 'checkin_interval': 5,
                 'timer_duration': 300,
                 'max_checkin_rate': MAX_CHECKIN_RATE
-            }
+            },
+            'bssid_mappings': {}  # Separate storage for classroom to BSSID mappings
         }
         self.lock = threading.Lock()
         self._initialize_data()
@@ -147,6 +148,21 @@ class JSONDatabase:
         with self.lock:
             return self.data['server_settings']
 
+    def get_expected_bssid(self, classroom):
+        with self.lock:
+            # Check all teachers' mappings for this classroom
+            for teacher in self.data['teachers'].values():
+                if 'bssid_mapping' in teacher and classroom in teacher['bssid_mapping']:
+                    return teacher['bssid_mapping'][classroom]
+            return None
+
+    def get_bssid_mappings(self, teacher_id):
+        with self.lock:
+            teacher = self.data['teachers'].get(teacher_id)
+            if teacher:
+                return teacher.get('bssid_mapping', {})
+            return {}
+
     def add_teacher(self, teacher_data):
         with self.lock:
             self.data['teachers'][teacher_data['id']] = teacher_data
@@ -209,6 +225,14 @@ class JSONDatabase:
     def update_timetable(self, branch, semester, timetable):
         with self.lock:
             self.data['timetables'][branch][semester] = timetable
+
+    def set_bssid_mapping(self, teacher_id, classroom, bssid):
+        with self.lock:
+            if teacher_id in self.data['teachers']:
+                teacher = self.data['teachers'][teacher_id]
+                if 'bssid_mapping' not in teacher:
+                    teacher['bssid_mapping'] = {}
+                teacher['bssid_mapping'][classroom] = bssid
 
     def delete_student(self, student_id):
         with self.lock:
@@ -552,12 +576,7 @@ def student_login():
         
         # Find BSSID by checking classroom mapping
         classroom = student['classroom']
-        teacher = next((t for t in server.db.data['teachers'].values() 
-                       if classroom in t.get('classrooms', [])), None)
-        
-        classroom_bssid = None
-        if teacher and 'bssid_mapping' in teacher:
-            classroom_bssid = teacher['bssid_mapping'].get(classroom)
+        expected_bssid = server.db.get_expected_bssid(classroom)
         
         return jsonify({
             'message': 'Login successful',
@@ -568,7 +587,7 @@ def student_login():
                 'branch': student['branch'],
                 'semester': student['semester']
             },
-            'classroom_bssid': classroom_bssid
+            'expected_bssid': expected_bssid
         }), 200
     except Exception as e:
         logger.error(f"Student login error: {str(e)}")
@@ -607,6 +626,9 @@ def student_get_status():
         authorized_bssid = server.db.get_server_settings()['authorized_bssid']
         is_authorized = checkin and checkin['bssid'] == authorized_bssid
         
+        # Get expected BSSID for student's classroom
+        expected_bssid = server.db.get_expected_bssid(student['classroom'])
+        
         status = {
             'student_id': student_id,
             'name': student['name'],
@@ -619,7 +641,8 @@ def student_get_status():
                 'remaining': timer['remaining'] if timer else 0,
                 'start_time': timer['start_time'] if timer else None
             },
-            'expected_bssid': authorized_bssid
+            'expected_bssid': expected_bssid,
+            'is_connected_to_correct_bssid': checkin and checkin['bssid'] == expected_bssid
         }
         
         return jsonify(status), 200
@@ -766,6 +789,42 @@ def cleanup_dead_sessions():
     except Exception as e:
         logger.error(f"Error cleaning up sessions: {str(e)}")
         return jsonify({'error': 'Cleanup failed', 'details': str(e)}), 500
+
+@app.route('/student/get_expected_bssid', methods=['GET'])
+def get_expected_bssid():
+    student_id = request.args.get('student_id')
+    device_id = request.args.get('device_id')
+    
+    if not all([student_id, device_id]):
+        return jsonify({'error': 'Student ID and device ID are required'}), 400
+    
+    try:
+        student = server.db.get_student(student_id)
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # Check device binding
+        if student['locked_device_id'] and student['locked_device_id'] != device_id:
+            return jsonify({'error': 'Unauthorized device'}), 403
+        
+        # Update last activity
+        server.db.add_active_device({
+            'student_id': student_id,
+            'device_id': device_id,
+            'last_activity': datetime.now().isoformat()
+        })
+        
+        # Get expected BSSID for student's classroom
+        classroom = student['classroom']
+        expected_bssid = server.db.get_expected_bssid(classroom)
+        
+        return jsonify({
+            'expected_bssid': expected_bssid,
+            'classroom': classroom
+        }), 200
+    except Exception as e:
+        logger.error(f"Error getting expected BSSID: {str(e)}")
+        return jsonify({'error': 'Failed to get expected BSSID', 'details': str(e)}), 500
 
 # Teacher endpoints
 @app.route('/teacher/signup', methods=['POST'])
@@ -992,33 +1051,40 @@ def update_bssid_mapping():
         if not teacher:
             return jsonify({'error': 'Teacher not found'}), 404
         
-        # Get current bssid_mapping
-        bssid_mapping = teacher.get('bssid_mapping', {})
+        # Update the global BSSID mapping
+        server.db.set_bssid_mapping(teacher_id, classroom, bssid)
         
-        # Update the mapping
-        bssid_mapping[classroom] = bssid
-        
-        # Update teacher record
-        updates = {'bssid_mapping': bssid_mapping}
-        
-        # Add classroom to teacher's classrooms if not present
-        if classroom not in teacher.get('classrooms', []):
-            updates['classrooms'] = teacher.get('classrooms', []) + [classroom]
-        
-        server.db.update_teacher(teacher_id, updates)
-        
-        # Update authorized BSSID if it matches this classroom's previous BSSID
-        settings = server.db.get_server_settings()
-        if settings['authorized_bssid'] == bssid_mapping.get(classroom):
+        # If this classroom is currently in session, update the authorized BSSID
+        active_session = server.db.get_active_session_for_classroom(classroom)
+        if active_session:
             server.db.update_server_settings({'authorized_bssid': bssid})
         
         return jsonify({
             'message': 'BSSID mapping updated successfully',
-            'bssid_mapping': bssid_mapping
+            'expected_bssid': bssid
         }), 200
     except Exception as e:
         logger.error(f"Error updating BSSID mapping: {str(e)}")
         return jsonify({'error': 'Update failed', 'details': str(e)}), 500
+
+@app.route('/teacher/get_bssid_mappings', methods=['GET'])
+def get_bssid_mappings():
+    teacher_id = request.args.get('teacher_id')
+    
+    if not teacher_id:
+        return jsonify({'error': 'Teacher ID is required'}), 400
+    
+    try:
+        teacher = server.db.get_teacher(teacher_id)
+        if not teacher:
+            return jsonify({'error': 'Teacher not found'}), 404
+        
+        return jsonify({
+            'bssid_mappings': teacher.get('bssid_mapping', {})
+        }), 200
+    except Exception as e:
+        logger.error(f"Error getting BSSID mappings: {str(e)}")
+        return jsonify({'error': 'Failed to get BSSID mappings', 'details': str(e)}), 500
 
 @app.route('/teacher/start_session', methods=['POST'])
 def start_session():
@@ -1063,10 +1129,14 @@ def start_session():
         if authorized_bssid:
             server.db.update_server_settings({'authorized_bssid': authorized_bssid})
         
+        # Get expected BSSID for this classroom
+        expected_bssid = server.db.get_expected_bssid(classroom)
+        
         return jsonify({
             'message': 'Session started successfully',
             'session_id': session_id,
-            'authorized_bssid': authorized_bssid
+            'authorized_bssid': authorized_bssid,
+            'expected_bssid': expected_bssid
         }), 201
     except Exception as e:
         logger.error(f"Error starting session: {str(e)}")
