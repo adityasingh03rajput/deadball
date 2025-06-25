@@ -105,10 +105,9 @@ class DatabaseManager:
             # Active devices table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS active_devices (
-                    student_id TEXT NOT NULL,
+                    student_id TEXT PRIMARY KEY,
                     device_id TEXT NOT NULL,
                     last_activity TEXT NOT NULL,
-                    PRIMARY KEY (student_id, device_id),
                     FOREIGN KEY (student_id) REFERENCES students (id)
                 )
             ''')
@@ -373,36 +372,27 @@ class AttendanceServer:
             
             with self.lock:
                 inactive_devices = self.db.fetch_all(
-                    'SELECT student_id, device_id FROM active_devices WHERE last_activity < ?',
+                    'SELECT student_id FROM active_devices WHERE last_activity < ?',
                     (threshold,)
                 )
                 
                 for device in inactive_devices:
                     student_id = device['student_id']
-                    device_id = device['device_id']
-                    
-                    # Only clean up if the device is still inactive
-                    current_status = self.db.fetch_one(
-                        'SELECT 1 FROM active_devices WHERE student_id = ? AND device_id = ? AND last_activity >= ?',
-                        (student_id, device_id, threshold)
+                    self.db.execute(
+                        'DELETE FROM active_devices WHERE student_id = ?',
+                        (student_id,),
+                        commit=True
                     )
-                    
-                    if not current_status:
-                        self.db.execute(
-                            'DELETE FROM active_devices WHERE student_id = ? AND device_id = ?',
-                            (student_id, device_id),
-                            commit=True
-                        )
-                        self.db.execute(
-                            'DELETE FROM checkins WHERE student_id = ? AND device_id = ?',
-                            (student_id, device_id),
-                            commit=True
-                        )
-                        self.db.execute(
-                            'DELETE FROM timers WHERE student_id = ?',
-                            (student_id,),
-                            commit=True
-                        )
+                    self.db.execute(
+                        'DELETE FROM checkins WHERE student_id = ?',
+                        (student_id,),
+                        commit=True
+                    )
+                    self.db.execute(
+                        'DELETE FROM timers WHERE student_id = ?',
+                        (student_id,),
+                        commit=True
+                    )
             
             time.sleep(60)
     
@@ -704,16 +694,12 @@ def update_bssid_mapping():
     with server.lock:
         teacher = server.db.fetch_one('SELECT * FROM teachers WHERE id = ?', (teacher_id,))
         if not teacher:
-            return jsonify({'error': 'Teacher not found'}), 404
-        
+            return jsonify({'error': 'Teacher not found'}), 404        
         # Get current bssid_mapping
         bssid_mapping = json.loads(teacher['bssid_mapping'])
         
         # Update the mapping
-        if bssid:
-            bssid_mapping[classroom] = bssid
-        elif classroom in bssid_mapping:
-            del bssid_mapping[classroom]
+        bssid_mapping[classroom] = bssid
         
         # Update teacher record
         server.db.execute(
@@ -734,16 +720,12 @@ def update_bssid_mapping():
         
         # Update authorized BSSID if it matches this classroom's previous BSSID
         settings = server.db.fetch_one('SELECT authorized_bssid FROM server_settings')
-        if settings['authorized_bssid'] in bssid_mapping.values():
-            # Find the classroom with this BSSID
-            for cls, bss in bssid_mapping.items():
-                if bss == settings['authorized_bssid']:
-                    server.db.execute(
-                        'UPDATE server_settings SET authorized_bssid = ?',
-                        (bssid_mapping[cls],),
-                        commit=True
-                    )
-                    break
+        if settings['authorized_bssid'] == bssid_mapping.get(classroom):
+            server.db.execute(
+                'UPDATE server_settings SET authorized_bssid = ?',
+                (bssid,),
+                commit=True
+            )
         
         return jsonify({
             'message': 'BSSID mapping updated successfully',
@@ -965,40 +947,26 @@ def get_status():
         for student in students:
             student_id = student['id']
             
-            # Get all active devices for this student
-            active_devices = server.db.fetch_all(
-                'SELECT device_id FROM active_devices WHERE student_id = ?',
+            # Get checkin
+            checkin = server.db.fetch_one(
+                'SELECT * FROM checkins WHERE student_id = ? ORDER BY timestamp DESC LIMIT 1',
                 (student_id,)
             )
             
-            # Get latest checkin for each device
-            device_statuses = []
-            for device in active_devices:
-                device_id = device['device_id']
-                checkin = server.db.fetch_one(
-                    'SELECT * FROM checkins WHERE student_id = ? AND device_id = ? ORDER BY timestamp DESC LIMIT 1',
-                    (student_id, device_id)
-                )
-                
-                authorized_bssid = status['authorized_bssid']
-                is_authorized = checkin and checkin['bssid'] == authorized_bssid
-                
-                device_statuses.append({
-                    'device_id': device_id,
-                    'connected': True,
-                    'authorized': is_authorized,
-                    'timestamp': checkin['timestamp'] if checkin else None
-                })
-            
-            # Get timer (shared across all devices for the student)
+            # Get timer
             timer = server.db.fetch_one('SELECT * FROM timers WHERE student_id = ?', (student_id,))
+            
+            authorized_bssid = status['authorized_bssid']
+            is_authorized = checkin and checkin['bssid'] == authorized_bssid
             
             status['students'][student_id] = {
                 'name': student['name'],
                 'classroom': student['classroom'],
                 'branch': student['branch'],
                 'semester': student['semester'],
-                'devices': device_statuses,
+                'connected': checkin is not None,
+                'authorized': is_authorized,
+                'timestamp': checkin['timestamp'] if checkin else None,
                 'timer': {
                     'status': timer['status'] if timer else 'stop',
                     'remaining': timer['remaining'] if timer else 0,
@@ -1194,33 +1162,27 @@ def student_login():
         if not check_password_hash(student['password'], password):
             return jsonify({'error': 'Incorrect password'}), 401
         
-        # Check if already logged in on this device (allow re-login on same device)
+        # Check if already logged in on another device
         active_device = server.db.fetch_one(
-            'SELECT * FROM active_devices WHERE student_id = ? AND device_id = ?',
+            'SELECT * FROM active_devices WHERE student_id = ? AND device_id != ?',
             (student_id, device_id)
         )
-        
         if active_device:
-            # Update last activity and return success
+            return jsonify({'error': 'This account is already logged in on another device'}), 403
+        
+        # Update or insert active device
+        existing = server.db.fetch_one(
+            'SELECT 1 FROM active_devices WHERE student_id = ?',
+            (student_id,)
+        )
+        
+        if existing:
             server.db.execute(
-                'UPDATE active_devices SET last_activity = ? WHERE student_id = ? AND device_id = ?',
-                (datetime.now().isoformat(), student_id, device_id),
+                'UPDATE active_devices SET device_id = ?, last_activity = ? WHERE student_id = ?',
+                (device_id, datetime.now().isoformat(), student_id),
                 commit=True
             )
         else:
-            # Check if logged in on another device
-            other_devices = server.db.fetch_all(
-                'SELECT device_id FROM active_devices WHERE student_id = ?',
-                (student_id,)
-            )
-            
-            if other_devices:
-                return jsonify({
-                    'error': 'This account is already logged in on another device',
-                    'device_id': other_devices[0]['device_id']
-                }), 403
-            
-            # Create new device record
             server.db.execute(
                 'INSERT INTO active_devices (student_id, device_id, last_activity) VALUES (?, ?, ?)',
                 (student_id, device_id, datetime.now().isoformat()),
@@ -1273,8 +1235,8 @@ def student_checkin():
 
         # Update last activity
         server.db.execute(
-            'UPDATE active_devices SET last_activity = ? WHERE student_id = ? AND device_id = ?',
-            (datetime.now().isoformat(), student_id, device_id),
+            'UPDATE active_devices SET last_activity = ? WHERE student_id = ?',
+            (datetime.now().isoformat(), student_id),
             commit=True
         )
 
@@ -1341,8 +1303,8 @@ def student_start_timer():
 
         # Check authorization via latest checkin
         checkin = server.db.fetch_one(
-            'SELECT * FROM checkins WHERE student_id = ? AND device_id = ? ORDER BY timestamp DESC LIMIT 1',
-            (student_id, device_id)
+            'SELECT * FROM checkins WHERE student_id = ? ORDER BY timestamp DESC LIMIT 1',
+            (student_id,)
         )
 
         # Get authorized BSSID for student's classroom
@@ -1364,8 +1326,8 @@ def student_start_timer():
 
         # Update last activity
         server.db.execute(
-            'UPDATE active_devices SET last_activity = ? WHERE student_id = ? AND device_id = ?',
-            (datetime.now().isoformat(), student_id, device_id),
+            'UPDATE active_devices SET last_activity = ? WHERE student_id = ?',
+            (datetime.now().isoformat(), student_id),
             commit=True
         )
 
@@ -1401,8 +1363,8 @@ def student_stop_timer():
         
         # Update last activity
         server.db.execute(
-            'UPDATE active_devices SET last_activity = ? WHERE student_id = ? AND device_id = ?',
-            (datetime.now().isoformat(), student_id, device_id),
+            'UPDATE active_devices SET last_activity = ? WHERE student_id = ?',
+            (datetime.now().isoformat(), student_id),
             commit=True
         )
         
@@ -1440,15 +1402,15 @@ def student_get_status():
         
         # Update last activity
         server.db.execute(
-            'UPDATE active_devices SET last_activity = ? WHERE student_id = ? AND device_id = ?',
-            (datetime.now().isoformat(), student_id, device_id),
+            'UPDATE active_devices SET last_activity = ? WHERE student_id = ?',
+            (datetime.now().isoformat(), student_id),
             commit=True
         )
         
         # Get checkin
         checkin = server.db.fetch_one(
-            'SELECT * FROM checkins WHERE student_id = ? AND device_id = ? ORDER BY timestamp DESC LIMIT 1',
-            (student_id, device_id)
+            'SELECT * FROM checkins WHERE student_id = ? ORDER BY timestamp DESC LIMIT 1',
+            (student_id,)
         )
         
         # Get timer
@@ -1468,7 +1430,9 @@ def student_get_status():
                 'status': timer['status'] if timer else 'stop',
                 'remaining': timer['remaining'] if timer else 0,
                 'start_time': timer['start_time'] if timer else None
-            }
+            },
+            # The fix: Include expected BSSID in the response
+            'expected_bssid': authorized_bssid
         }
         
         return jsonify(status), 200
@@ -1493,8 +1457,8 @@ def student_get_attendance():
         
         # Update last activity
         server.db.execute(
-            'UPDATE active_devices SET last_activity = ? WHERE student_id = ? AND device_id = ?',
-            (datetime.now().isoformat(), student_id, device_id),
+            'UPDATE active_devices SET last_activity = ? WHERE student_id = ?',
+            (datetime.now().isoformat(), student_id),
             commit=True
         )
         
@@ -1575,8 +1539,8 @@ def student_ping():
             return jsonify({'error': 'Unauthorized device'}), 403
         
         server.db.execute(
-            'UPDATE active_devices SET last_activity = ? WHERE student_id = ? AND device_id = ?',
-            (datetime.now().isoformat(), student_id, device_id),
+            'UPDATE active_devices SET last_activity = ? WHERE student_id = ?',
+            (datetime.now().isoformat(), student_id),
             commit=True
         )
         
@@ -1599,28 +1563,22 @@ def cleanup_dead_sessions():
         )
         if device:
             server.db.execute(
-                'DELETE FROM active_devices WHERE student_id = ? AND device_id = ?',
-                (student_id, device_id),
+                'DELETE FROM active_devices WHERE student_id = ?',
+                (student_id,),
                 commit=True
             )
         
         server.db.execute(
-            'DELETE FROM checkins WHERE student_id = ? AND device_id = ?',
-            (student_id, device_id),
+            'DELETE FROM checkins WHERE student_id = ?',
+            (student_id,),
             commit=True
         )
         
-        # Only cleanup timer if no other devices are active
-        active_devices = server.db.fetch_all(
-            'SELECT 1 FROM active_devices WHERE student_id = ?',
-            (student_id,)
+        server.db.execute(
+            'DELETE FROM timers WHERE student_id = ?',
+            (student_id,),
+            commit=True
         )
-        if not active_devices:
-            server.db.execute(
-                'DELETE FROM timers WHERE student_id = ?',
-                (student_id,),
-                commit=True
-            )
     
     return jsonify({'message': 'Session cleanup completed'}), 200
 
