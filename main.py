@@ -309,47 +309,66 @@ class AttendanceServer:
             time.sleep(1)
     
     def record_attendance(self, student_id):
-        """Record attendance for completed timer"""
-        with self.lock:
-            student = self.db.fetch_one('SELECT * FROM students WHERE id = ?', (student_id,))
-            if not student:
-                return
-            
-            timer = self.db.fetch_one('SELECT * FROM timers WHERE student_id = ?', (student_id,))
-            if not timer or timer['status'] != 'completed':
-                return
-            
-            # Check authorization
-            checkin = self.db.fetch_one(
-                'SELECT * FROM checkins WHERE student_id = ? ORDER BY timestamp DESC LIMIT 1',
-                (student_id,)
-            )
-            
-            authorized_bssid = self.db.fetch_one('SELECT authorized_bssid FROM server_settings')['authorized_bssid']
-            is_authorized = checkin and checkin['bssid'] == authorized_bssid
-            
-            date_str = datetime.fromtimestamp(timer['start_time']).date().isoformat()
-            session_key = f"timer_{int(timer['start_time'])}"
-            
-            attendance = json.loads(student['attendance']) if student['attendance'] else {}
-            if date_str not in attendance:
-                attendance[date_str] = {}
-            
-            attendance[date_str][session_key] = {
-                'status': 'present' if is_authorized else 'absent',
-                'subject': 'Timer Session',
-                'classroom': student['classroom'],
-                'start_time': datetime.fromtimestamp(timer['start_time']).isoformat(),
-                'end_time': datetime.fromtimestamp(timer['start_time'] + self.TIMER_DURATION).isoformat(),
-                'branch': student['branch'],
-                'semester': student['semester']
-            }
-            
-            self.db.execute(
-                'UPDATE students SET attendance = ? WHERE id = ?',
-                (json.dumps(attendance), student_id),
-                commit=True
-            )
+    """Record attendance for completed timer"""
+    with self.lock:
+        student = self.db.fetch_one('SELECT * FROM students WHERE id = ?', (student_id,))
+        if not student:
+            return
+
+        timer = self.db.fetch_one('SELECT * FROM timers WHERE student_id = ?', (student_id,))
+        if not timer or timer['status'] != 'completed':
+            return
+
+        # Fetch most recent check-in BSSID
+        checkin = self.db.fetch_one(
+            'SELECT * FROM checkins WHERE student_id = ? ORDER BY timestamp DESC LIMIT 1',
+            (student_id,)
+        )
+
+        # Get the student's classroom
+        classroom = student['classroom']
+
+        # Look up authorized BSSID from teacher's bssid_mapping
+        teachers = self.db.fetch_all('SELECT bssid_mapping, classrooms FROM teachers')
+        authorized_bssid = None
+
+        for teacher in teachers:
+            try:
+                classrooms = json.loads(teacher['classrooms'])
+                bssid_mapping = json.loads(teacher['bssid_mapping'])
+
+                if classroom in classrooms:
+                    authorized_bssid = bssid_mapping.get(classroom)
+                    break
+            except Exception:
+                continue  # Ignore bad records
+
+        # Determine if check-in BSSID matches expected
+        is_authorized = checkin and checkin['bssid'] == authorized_bssid
+
+        # Build session key and attendance record
+        date_str = datetime.fromtimestamp(timer['start_time']).date().isoformat()
+        session_key = f"timer_{int(timer['start_time'])}"
+
+        attendance = json.loads(student['attendance']) if student['attendance'] else {}
+        if date_str not in attendance:
+            attendance[date_str] = {}
+
+        attendance[date_str][session_key] = {
+            'status': 'present' if is_authorized else 'absent',
+            'subject': 'Timer Session',
+            'classroom': classroom,
+            'start_time': datetime.fromtimestamp(timer['start_time']).isoformat(),
+            'end_time': datetime.fromtimestamp(timer['start_time'] + self.TIMER_DURATION).isoformat(),
+            'branch': student['branch'],
+            'semester': student['semester']
+        }
+
+        self.db.execute(
+            'UPDATE students SET attendance = ? WHERE id = ?',
+            (json.dumps(attendance), student_id),
+            commit=True
+        )
     
     def cleanup_checkins(self):
         """Background thread to clean up old checkins"""
@@ -1304,25 +1323,30 @@ def student_start_timer():
         ):
             return jsonify({'error': 'Unauthorized device'}), 403
 
-        # Check authorization via latest checkin
+        # Get latest check-in
         checkin = server.db.fetch_one(
             'SELECT * FROM checkins WHERE student_id = ? ORDER BY timestamp DESC LIMIT 1',
             (student_id,)
         )
 
-        # Get authorized BSSID for student's classroom
+        # Get student's classroom
         student = server.db.fetch_one('SELECT classroom FROM students WHERE id = ?', (student_id,))
         classroom = student['classroom']
-        
-        teacher = server.db.fetch_one(
-            'SELECT bssid_mapping FROM teachers WHERE json_extract(classrooms, ?) IS NOT NULL',
-            (f'$."{classroom}"',)
-        )
-        
+
+        # Find matching teacher who has this classroom
+        teachers = server.db.fetch_all('SELECT bssid_mapping, classrooms FROM teachers')
         authorized_bssid = None
-        if teacher:
-            bssid_mapping = json.loads(teacher['bssid_mapping'])
-            authorized_bssid = bssid_mapping.get(classroom)
+
+        for teacher in teachers:
+            try:
+                classrooms = json.loads(teacher['classrooms'])
+                bssid_mapping = json.loads(teacher['bssid_mapping'])
+
+                if classroom in classrooms:
+                    authorized_bssid = bssid_mapping.get(classroom)
+                    break
+            except Exception as e:
+                continue  # ignore malformed records
 
         if not checkin or checkin['bssid'] != authorized_bssid:
             return jsonify({'error': 'Not authorized to start timer - BSSID mismatch'}), 403
