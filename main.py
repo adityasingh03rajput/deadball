@@ -309,110 +309,106 @@ class AttendanceServer:
             time.sleep(1)
     
     def record_attendance(self, student_id):
-    """Record attendance for completed timer"""
-    with self.lock:
-        student = self.db.fetch_one('SELECT * FROM students WHERE id = ?', (student_id,))
-        if not student:
-            return
+        """Record attendance for completed timer"""
+        with self.lock:
+            student = self.db.fetch_one('SELECT * FROM students WHERE id = ?', (student_id,))
+            if not student:
+                return
 
-        timer = self.db.fetch_one('SELECT * FROM timers WHERE student_id = ?', (student_id,))
-        if not timer or timer['status'] != 'completed':
-            return
+            timer = self.db.fetch_one('SELECT * FROM timers WHERE student_id = ?', (student_id,))
+            if not timer or timer['status'] != 'completed':
+                return
 
-        # Fetch most recent check-in BSSID
-        checkin = self.db.fetch_one(
-            'SELECT * FROM checkins WHERE student_id = ? ORDER BY timestamp DESC LIMIT 1',
-            (student_id,)
-        )
+            # Fetch most recent check-in BSSID
+            checkin = self.db.fetch_one(
+                'SELECT * FROM checkins WHERE student_id = ? ORDER BY timestamp DESC LIMIT 1',
+                (student_id,)
+            )
 
-        # Get the student's classroom
-        classroom = student['classroom']
+            # Get the student's classroom
+            classroom = student['classroom']
 
-        # Look up authorized BSSID from teacher's bssid_mapping
-        teachers = self.db.fetch_all('SELECT bssid_mapping, classrooms FROM teachers')
-        authorized_bssid = None
+            # Look up authorized BSSID from teacher's bssid_mapping
+            teachers = self.db.fetch_all('SELECT bssid_mapping, classrooms FROM teachers')
+            authorized_bssid = None
 
-        for teacher in teachers:
-            try:
-                classrooms = json.loads(teacher['classrooms'])
-                bssid_mapping = json.loads(teacher['bssid_mapping'])
+            for teacher in teachers:
+                try:
+                    classrooms = json.loads(teacher['classrooms'])
+                    bssid_mapping = json.loads(teacher['bssid_mapping'])
 
-                if classroom in classrooms:
-                    authorized_bssid = bssid_mapping.get(classroom)
-                    break
-            except Exception:
-                continue  # Ignore bad records
+                    if classroom in classrooms:
+                        authorized_bssid = bssid_mapping.get(classroom)
+                        break
+                except Exception:
+                    continue  # Ignore bad records
 
-        # Determine if check-in BSSID matches expected
-        is_authorized = checkin and checkin['bssid'] == authorized_bssid
+            # Determine if check-in BSSID matches expected
+            is_authorized = checkin and checkin['bssid'] == authorized_bssid
 
-        # Build session key and attendance record
-        date_str = datetime.fromtimestamp(timer['start_time']).date().isoformat()
-        session_key = f"timer_{int(timer['start_time'])}"
+            # Build session key and attendance record
+            date_str = datetime.fromtimestamp(timer['start_time']).date().isoformat()
+            session_key = f"timer_{int(timer['start_time'])}"
 
-        attendance = json.loads(student['attendance']) if student['attendance'] else {}
-        if date_str not in attendance:
-            attendance[date_str] = {}
+            attendance = json.loads(student['attendance']) if student['attendance'] else {}
+            if date_str not in attendance:
+                attendance[date_str] = {}
 
-        attendance[date_str][session_key] = {
-            'status': 'present' if is_authorized else 'absent',
-            'subject': 'Timer Session',
-            'classroom': classroom,
-            'start_time': datetime.fromtimestamp(timer['start_time']).isoformat(),
-            'end_time': datetime.fromtimestamp(timer['start_time'] + self.TIMER_DURATION).isoformat(),
-            'branch': student['branch'],
-            'semester': student['semester']
-        }
+            attendance[date_str][session_key] = {
+                'status': 'present' if is_authorized else 'absent',
+                'subject': 'Timer Session',
+                'classroom': classroom,
+                'start_time': datetime.fromtimestamp(timer['start_time']).isoformat(),
+                'end_time': datetime.fromtimestamp(timer['start_time'] + self.TIMER_DURATION).isoformat(),
+                'branch': student['branch'],
+                'semester': student['semester']
+            }
 
-        self.db.execute(
-            'UPDATE students SET attendance = ? WHERE id = ?',
-            (json.dumps(attendance), student_id),
-            commit=True
-        )
+            self.db.execute(
+                'UPDATE students SET attendance = ? WHERE id = ?',
+                (json.dumps(attendance), student_id),
+                commit=True
+            )
     
     def cleanup_checkins(self):
         """Background thread to clean up old checkins"""
         while self.running:
-            threshold = (datetime.now() - timedelta(minutes=10)).isoformat()
-            
-            with self.lock:
-                self.db.execute(
-                    'DELETE FROM checkins WHERE timestamp < ?',
-                    (threshold,),
-                    commit=True
-                )
-            
+            try:
+                threshold = (datetime.now() - timedelta(minutes=10)).isoformat()
+
+                with self.lock:
+                    self.db.execute(
+                        'DELETE FROM checkins WHERE timestamp < ?',
+                        (threshold,),
+                        commit=True
+                    )
+                    print(f"[Cleanup] Old check-ins before {threshold} removed.")
+            except Exception as e:
+                print(f"[Cleanup Error] Failed to clean check-ins: {e}")
+
             time.sleep(60)
     
     def cleanup_active_devices(self):
         """Background thread to clean up inactive devices"""
         while self.running:
-            threshold = (datetime.now() - timedelta(minutes=5)).isoformat()
-            
-            with self.lock:
-                inactive_devices = self.db.fetch_all(
-                    'SELECT student_id FROM active_devices WHERE last_activity < ?',
-                    (threshold,)
-                )
-                
-                for device in inactive_devices:
-                    student_id = device['student_id']
-                    self.db.execute(
-                        'DELETE FROM active_devices WHERE student_id = ?',
-                        (student_id,),
-                        commit=True
+            try:
+                threshold = (datetime.now() - timedelta(minutes=5)).isoformat()
+
+                with self.lock:
+                    inactive_devices = self.db.fetch_all(
+                        'SELECT student_id FROM active_devices WHERE last_activity < ?',
+                        (threshold,)
                     )
-                    self.db.execute(
-                        'DELETE FROM checkins WHERE student_id = ?',
-                        (student_id,),
-                        commit=True
-                    )
-                    self.db.execute(
-                        'DELETE FROM timers WHERE student_id = ?',
-                        (student_id,),
-                        commit=True
-                    )
-            
+
+                    for device in inactive_devices:
+                        student_id = device['student_id']
+                        self.db.execute('DELETE FROM active_devices WHERE student_id = ?', (student_id,), commit=True)
+                        self.db.execute('DELETE FROM checkins WHERE student_id = ?', (student_id,), commit=True)
+                        self.db.execute('DELETE FROM timers WHERE student_id = ?', (student_id,), commit=True)
+                        print(f"[Cleanup] Removed inactive session for student: {student_id}")
+            except Exception as e:
+                print(f"[Cleanup Error] Failed to clean active devices: {e}")
+
             time.sleep(60)
     
     def start_timer(self, student_id):
@@ -1181,36 +1177,72 @@ def student_login():
         if not check_password_hash(student['password'], password):
             return jsonify({'error': 'Incorrect password'}), 401
         
-        # Check if already logged in on another device
-        active_device = server.db.fetch_one(
-            'SELECT * FROM active_devices WHERE student_id = ? AND device_id != ?',
-            (student_id, device_id)
-        )
-        if active_device:
-            return jsonify({'error': 'This account is already logged in on another device'}), 403
-        
-        # Update or insert active device
+        # Check if student is already locked to a different device
         existing = server.db.fetch_one(
-            'SELECT 1 FROM active_devices WHERE student_id = ?',
-            (student_id,)
+            'SELECT * FROM active_devices WHERE student_id = ?', (student_id,)
         )
+        if existing and existing['device_id'] != device_id:
+            return jsonify({'error': 'This student is already locked to another device'}), 403
         
-        if existing:
-            server.db.execute(
-                'UPDATE active_devices SET device_id = ?, last_activity = ? WHERE student_id = ?',
-                (device_id, datetime.now().isoformat(), student_id),
-                commit=True
-            )
-        else:
-            server.db.execute(
-                'INSERT INTO active_devices (student_id, device_id, last_activity) VALUES (?, ?, ?)',
-                (student_id, device_id, datetime.now().isoformat()),
-                commit=True
-            )
+        # Check if this device is already locked to another student
+        device_lock = server.db.fetch_one(
+            'SELECT * FROM active_devices WHERE device_id = ? AND student_id != ?',
+            (device_id, student_id)
+        )
+        if device_lock:
+            return jsonify({'error': 'This device is already locked to another student'}), 403
         
-        # New logic: Find BSSID by checking Python list of classrooms
-        teachers = server.db.fetch_all('SELECT bssid_mapping, classrooms FROM teachers')
-        classroom_bssid = None
+    # Enforce one-to-one binding between student and device
+    
+    # Check if this student is already logged in from another device
+    existing_device = server.db.fetch_one(
+        'SELECT * FROM active_devices WHERE student_id = ?', (student_id,)
+    )
+    if existing_device and existing_device['device_id'] != device_id:
+        return jsonify({'error': 'This student is already logged in on another device'}), 403
+    
+    # Check if this device is already used by another student
+    device_lock = server.db.fetch_one(
+        'SELECT * FROM active_devices WHERE device_id = ? AND student_id != ?',
+        (device_id, student_id)
+    )
+    if device_lock:
+        return jsonify({'error': 'This device is already locked to another student'}), 403
+    
+    # Update or insert active device
+    existing = server.db.fetch_one(
+        'SELECT 1 FROM active_devices WHERE student_id = ?',
+        (student_id,)
+    )
+    
+    if existing:
+        server.db.execute(
+            'UPDATE active_devices SET device_id = ?, last_activity = ? WHERE student_id = ?',
+            (device_id, datetime.now().isoformat(), student_id),
+            commit=True
+        )
+    else:
+        server.db.execute(
+            'INSERT INTO active_devices (student_id, device_id, last_activity) VALUES (?, ?, ?)',
+            (student_id, device_id, datetime.now().isoformat()),
+            commit=True
+        )
+    
+    # New logic: Find BSSID by checking Python list of classrooms
+    teachers = server.db.fetch_all('SELECT bssid_mapping, classrooms FROM teachers')
+    classroom_bssid = None
+    
+    for teacher in teachers:
+        try:
+            classrooms = json.loads(teacher['classrooms'])
+            bssid_mapping = json.loads(teacher['bssid_mapping'])
+    
+            if student['classroom'] in classrooms:
+                classroom_bssid = bssid_mapping.get(student['classroom'])
+                break
+        except Exception:
+            continue
+
 
         for teacher in teachers:
             try:
